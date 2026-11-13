@@ -1,0 +1,6 @@
+{
+  "name": "Live Auction & Interactive Bidding",
+  "description": "Live interactive auction platform with real-time bidding, product queues, text file upload, and anti-sniping for Nigerian marketplace.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
