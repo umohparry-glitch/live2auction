@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { ArrowRight, Bookmark, Clock, Package, Search, ShieldCheck } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { apiRequest } from '../services/api';
+import { AuctionCountdownTimer } from './AuctionCountdownTimer';
 
 export interface PublicAuctionItem {
   id: number;
@@ -408,9 +409,14 @@ export const PublicMarketplace: React.FC<PublicMarketplaceProps> = ({
                           <div className="text-xs text-slate-500 tabular-nums">
                             {item.bidsCount} {item.bidsCount === 1 ? 'bid' : 'bids'}
                           </div>
-                          <div className="text-xs font-mono font-semibold text-slate-800 tabular-nums flex items-center justify-end gap-1 mt-0.5">
-                            <Clock className="w-3.5 h-3.5 text-slate-400" />
-                            <span>{formatRemaining(item)}</span>
+                          <div className="flex justify-end mt-0.5">
+                            <AuctionCountdownTimer
+                              status={item.status}
+                              startTime={item.startTime}
+                              endTime={item.endTime}
+                              effectiveEndTime={item.effectiveEndTime}
+                              compact
+                            />
                           </div>
                         </div>
                       </div>

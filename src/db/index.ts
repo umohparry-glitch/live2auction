@@ -13,12 +13,29 @@ export const createPool = () => {
       user: process.env.SQL_USER,
       password: process.env.SQL_PASSWORD,
       database: process.env.SQL_DB_NAME,
-      max: 10,
+      max: 5,
+      idleTimeoutMillis: 20000,
       connectionTimeoutMillis: 15000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000,
+      allowExitOnIdle: true,
     });
 
-    global._postgresPool.on('error', (err) => {
-      console.error('Unexpected error on idle SQL pool client:', err);
+    global._postgresPool.on('error', (err: any) => {
+      // Cloud SQL / Auth Proxy routinely closes idle pooled sockets (e.g., scale-to-zero).
+      // pg.Pool automatically evicts the dead client and creates a new one on next query.
+      const msg = err?.message || '';
+      const code = err?.code || '';
+      if (
+        msg.includes('Connection terminated') ||
+        code === 'ECONNRESET' ||
+        code === 'EPIPE' ||
+        code === 'ETIMEDOUT' ||
+        code === '57P01'
+      ) {
+        return;
+      }
+      console.warn('SQL pool client notice:', msg || 'Unknown pool error');
     });
   }
   return global._postgresPool;

@@ -4,11 +4,21 @@ import { db } from '../db/index.ts';
 import { auctions, bids, notifications, watchlists } from '../db/schema.ts';
 
 const notifiedEndingSoonIds = new Set<number>();
+let lastReconcileAt = 0;
+let reconcileInFlight: Promise<void> | null = null;
 
-export function startAuctionLifecycleWorker(io: SocketIOServer) {
-  // Run periodically after server is listening (never at top-level import time)
-  const interval = setInterval(async () => {
+export async function reconcileAuctionLifecycles(io: SocketIOServer, force = false) {
+  const nowMs = Date.now();
+  if (!force && nowMs - lastReconcileAt < 10000) {
+    return;
+  }
+  if (reconcileInFlight) {
+    return reconcileInFlight;
+  }
+
+  reconcileInFlight = (async () => {
     try {
+      lastReconcileAt = Date.now();
       const now = new Date();
 
       // 1. Auto-start scheduled auctions whose startTime <= now
@@ -100,7 +110,6 @@ export function startAuctionLifecycleWorker(io: SocketIOServer) {
             auctionId: item.id,
           });
 
-          // Notify losing bidders
           const allBidders = await db
             .selectDistinct({ userId: bids.userId })
             .from(bids)
@@ -123,11 +132,23 @@ export function startAuctionLifecycleWorker(io: SocketIOServer) {
           winningBidAmount: closed?.winningBidAmount ?? null,
         });
       }
-    } catch (err) {
-      // Quietly log without crashing interval
-      console.error('Auction worker tick error:', err);
+    } catch (err: any) {
+      console.warn('Auction lifecycle reconcile notice:', err?.message || 'Unknown error');
+    } finally {
+      reconcileInFlight = null;
     }
-  }, 5000);
+  })();
+
+  return reconcileInFlight;
+}
+
+export function startAuctionLifecycleWorker(io: SocketIOServer) {
+  // Only reconcile when active browser clients are connected (avoids keeping Cloud SQL awake when idle)
+  const interval = setInterval(() => {
+    if (io.engine.clientsCount > 0) {
+      void reconcileAuctionLifecycles(io);
+    }
+  }, 30000);
 
   return () => clearInterval(interval);
 }

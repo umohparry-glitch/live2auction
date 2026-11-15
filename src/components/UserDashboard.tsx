@@ -153,7 +153,12 @@ export const UserDashboard: React.FC<UserDashboardProps> = ({
     try {
       const res = await apiRequest<{ message: string }>('/api/auth/change-password', {
         method: 'POST',
-        body: JSON.stringify({ currentPassword, newPassword, confirmPassword }),
+        body: JSON.stringify({
+          identifier: user?.username,
+          currentPassword,
+          newPassword,
+          confirmPassword,
+        }),
       });
       setCurrentPassword('');
       setNewPassword('');

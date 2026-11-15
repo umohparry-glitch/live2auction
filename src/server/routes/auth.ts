@@ -729,13 +729,15 @@ router.post('/reset-password', authLimiter, async (req, res) => {
 });
 
 // Change password while logged in (also handles mandatory initial admin password change)
-router.post('/change-password', requireAuth, async (req: AuthRequest, res) => {
+router.post('/change-password', authLimiter, async (req: AuthRequest, res) => {
   try {
+    await ensureSeeded();
     const currentPassword =
       typeof req.body.currentPassword === 'string' ? req.body.currentPassword : '';
     const newPassword = typeof req.body.newPassword === 'string' ? req.body.newPassword : '';
     const confirmPassword =
       typeof req.body.confirmPassword === 'string' ? req.body.confirmPassword : '';
+    const identifier = sanitizeText(req.body.identifier || '', 120);
 
     const pwdError = validatePasswordStrength(newPassword);
     if (pwdError) {
@@ -745,14 +747,38 @@ router.post('/change-password', requireAuth, async (req: AuthRequest, res) => {
       return res.status(400).json({ error: 'New passwords do not match.' });
     }
 
-    const [userRow] = await db
-      .select()
-      .from(users)
-      .where(eq(users.id, req.auth!.user.id))
-      .limit(1);
+    let userRow;
+    if (req.auth?.user) {
+      const [found] = await db
+        .select()
+        .from(users)
+        .where(eq(users.id, req.auth.user.id))
+        .limit(1);
+      userRow = found;
+    } else if (identifier && currentPassword) {
+      const [found] = await db
+        .select()
+        .from(users)
+        .where(
+          or(
+            sql`lower(${users.username}) = lower(${identifier})`,
+            sql`lower(${users.email}) = lower(${identifier})`
+          )
+        )
+        .limit(1);
+      userRow = found;
+    } else {
+      return res.status(401).json({
+        error: 'Authentication required. Please log in or enter your username and current password.',
+        code: 'AUTH_REQUIRED',
+      });
+    }
 
     if (!userRow) {
-      return res.status(404).json({ error: 'User not found.' });
+      return res.status(404).json({ error: 'User account not found.' });
+    }
+    if (userRow.status !== 'active') {
+      return res.status(403).json({ error: 'Account is suspended or inactive.' });
     }
 
     if (userRow.passwordHash) {
@@ -765,6 +791,11 @@ router.post('/change-password', requireAuth, async (req: AuthRequest, res) => {
           .status(400)
           .json({ error: 'New password must be different from your current password.' });
       }
+    } else if (!req.auth) {
+      return res.status(401).json({
+        error: 'Authentication required. Please log in or create an account.',
+        code: 'AUTH_REQUIRED',
+      });
     }
 
     const passwordHash = await hashPassword(newPassword);
@@ -776,6 +807,17 @@ router.post('/change-password', requireAuth, async (req: AuthRequest, res) => {
         updatedAt: new Date(),
       })
       .where(eq(users.id, userRow.id));
+
+    // Ensure a valid HTTP-only session cookie is issued/refreshed
+    if (!req.auth) {
+      await createSessionForUser(req, res, userRow.id, false, userRow.isAdmin);
+    }
+
+    const rbac = await loadUserRolesAndPermissions(userRow.id);
+    const { passwordHash: _ph, ...safeUser } = {
+      ...userRow,
+      mustChangePassword: false,
+    };
 
     await db.insert(notifications).values({
       userId: userRow.id,
@@ -798,6 +840,9 @@ router.post('/change-password', requireAuth, async (req: AuthRequest, res) => {
 
     res.json({
       success: true,
+      user: safeUser,
+      roles: rbac.roles,
+      permissions: rbac.permissions,
       message: 'Password updated successfully.',
     });
   } catch (err) {

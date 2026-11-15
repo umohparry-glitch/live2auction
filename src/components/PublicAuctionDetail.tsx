@@ -12,6 +12,7 @@ import {
 import { useAuth } from '../context/AuthContext';
 import { apiRequest } from '../services/api';
 import { PublicAuctionItem } from './PublicMarketplace';
+import { AuctionCountdownTimer } from './AuctionCountdownTimer';
 
 interface BidRow {
   id: number;
@@ -37,7 +38,7 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
   auctionId,
   onBack,
 }) => {
-  const { user, socket, requireAuthentication, showToast } = useAuth();
+  const { user, socket, websiteSettings, requireAuthentication, showToast } = useAuth();
   const [auction, setAuction] = useState<PublicAuctionItem | null>(null);
   const [bids, setBids] = useState<BidRow[]>([]);
   const [discussions, setDiscussions] = useState<DiscussionRow[]>([]);
@@ -46,7 +47,7 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
   const [discussionInput, setDiscussionInput] = useState('');
   const [bidding, setBidding] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [nowMs, setNowMs] = useState(Date.now());
+  const [isExtendedFlash, setIsExtendedFlash] = useState(false);
 
   const loadDetail = async () => {
     try {
@@ -72,8 +73,6 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
 
   useEffect(() => {
     loadDetail();
-    const timer = setInterval(() => setNowMs(Date.now()), 1000);
-    return () => clearInterval(timer);
   }, [auctionId]);
 
   useEffect(() => {
@@ -82,6 +81,10 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
 
     const onBid = (payload: any) => {
       if (payload.auctionId !== auctionId) return;
+      if (payload.extended) {
+        setIsExtendedFlash(true);
+        setTimeout(() => setIsExtendedFlash(false), 4000);
+      }
       setAuction((prev) =>
         prev
           ? {
@@ -209,15 +212,6 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
     auction.bidsCount === 0
       ? auction.startingPrice
       : auction.currentBid + auction.bidIncrement;
-
-  const targetTime =
-    auction.status === 'scheduled'
-      ? new Date(auction.startTime).getTime()
-      : new Date(auction.effectiveEndTime).getTime();
-  const diff = Math.max(0, targetTime - nowMs);
-  const hrs = Math.floor(diff / 3600000);
-  const mins = Math.floor((diff % 3600000) / 60000);
-  const secs = Math.floor((diff % 60000) / 1000);
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
@@ -357,39 +351,37 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
 
             <h1 className="text-2xl font-bold text-slate-900 font-display">{auction.title}</h1>
 
-            <div className="grid grid-cols-2 gap-4 py-4 border-y border-slate-100">
-              <div>
-                <div className="text-xs text-slate-500">
-                  {auction.bidsCount > 0 ? 'Current Highest Bid' : 'Starting Price'}
+            <div className="space-y-4 py-4 border-y border-slate-100">
+              <div className="flex items-end justify-between gap-4">
+                <div>
+                  <div className="text-xs text-slate-500">
+                    {auction.bidsCount > 0 ? 'Current Highest Bid' : 'Starting Price'}
+                  </div>
+                  <div className="text-2xl font-extrabold text-slate-900 tabular-nums mt-0.5">
+                    ₦{auction.currentBid.toLocaleString()}
+                  </div>
+                  <div className="text-xs text-slate-500 mt-1 tabular-nums">
+                    Est. Market Value: ₦{auction.estimatedMarketValue.toLocaleString()}
+                  </div>
                 </div>
-                <div className="text-2xl font-extrabold text-slate-900 tabular-nums mt-0.5">
-                  ₦{auction.currentBid.toLocaleString()}
-                </div>
-                <div className="text-xs text-slate-500 mt-1 tabular-nums">
-                  Est. Market Value: ₦{auction.estimatedMarketValue.toLocaleString()}
+                <div className="text-right text-xs text-slate-500 tabular-nums">
+                  <div className="font-semibold text-slate-900">
+                    {auction.bidsCount} {auction.bidsCount === 1 ? 'bid' : 'bids'}
+                  </div>
+                  <div>+₦{auction.bidIncrement.toLocaleString()} min step</div>
                 </div>
               </div>
 
-              <div className="text-right">
-                <div className="text-xs text-slate-500">
-                  {auction.status === 'scheduled'
-                    ? 'Starts In'
-                    : auction.status === 'ended'
-                    ? 'Final Status'
-                    : 'Time Remaining'}
-                </div>
-                <div className="text-xl font-mono font-bold text-slate-900 tabular-nums mt-0.5 flex items-center justify-end gap-1.5">
-                  <Clock className="w-4 h-4 text-emerald-600" />
-                  <span>
-                    {auction.status === 'ended'
-                      ? 'Closed'
-                      : `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`}
-                  </span>
-                </div>
-                <div className="text-xs text-slate-500 mt-1 tabular-nums">
-                  {auction.bidsCount} total bids · +{auction.bidIncrement.toLocaleString()} min step
-                </div>
-              </div>
+              <AuctionCountdownTimer
+                status={auction.status}
+                startTime={auction.startTime}
+                endTime={auction.endTime}
+                effectiveEndTime={auction.effectiveEndTime}
+                antiSnipingSeconds={websiteSettings?.antiSnipingSeconds || 60}
+                extensionCount={auction.extensionCount}
+                maxExtensions={auction.maxExtensions}
+                isExtended={isExtendedFlash}
+              />
             </div>
 
             {auction.status === 'live' ? (

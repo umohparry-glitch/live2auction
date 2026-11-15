@@ -17,6 +17,7 @@ import {
 } from '../../db/schema.ts';
 import { AuthRequest, getClientIp, requireAuth } from '../authMiddleware.ts';
 import { isValidPhone, sanitizeText } from '../security.ts';
+import { reconcileAuctionLifecycles } from '../auctionWorker.ts';
 
 export function createAuctionsRouter(io: SocketIOServer) {
   const router = Router();
@@ -55,6 +56,7 @@ export function createAuctionsRouter(io: SocketIOServer) {
   router.get('/public/auctions', async (req: AuthRequest, res) => {
     try {
       await ensureSeeded();
+      await reconcileAuctionLifecycles(io);
       const statusFilter = typeof req.query.status === 'string' ? req.query.status : 'all';
       const categoryFilter = typeof req.query.category === 'string' ? req.query.category : 'all';
       const searchFilter = typeof req.query.search === 'string' ? req.query.search.trim().toLowerCase() : '';

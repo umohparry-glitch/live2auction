@@ -33,6 +33,7 @@ import { speechAnnouncer } from '../utils/speechAnnouncer';
 import { RecentBidsTicker } from './RecentBidsTicker';
 import { SlotProductQueue } from './SlotProductQueue';
 import { SlotWeekScheduleModal } from './SlotWeekScheduleModal';
+import { AuctionCountdownTimer } from './AuctionCountdownTimer';
 
 interface LiveAuctionRoomProps {
   openPreBidModal: (product: any) => void;
@@ -743,53 +744,18 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
                 )}
               </AnimatePresence>
 
-              {/* Countdown & Anti-sniping Banner */}
-              <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                
-                {/* Timer Display */}
-                <div className="flex items-center gap-2">
-                  <div className={`p-1.5 rounded-lg ${timeRemaining <= 10 ? 'bg-rose-100 text-rose-700' : 'bg-slate-100 text-slate-700'}`}>
-                    <Clock className={`w-4 h-4 ${timeRemaining <= 10 ? 'animate-spin' : ''}`} />
-                  </div>
-                  <div>
-                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                      Time Remaining
-                    </div>
-                    <div className={`text-xl font-black font-mono tracking-tight ${
-                      timeRemaining <= 10 ? 'text-rose-600 animate-pulse' : 'text-slate-900'
-                    }`}>
-                      {formatTime(timeRemaining)}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Anti-Sniping Indicator */}
-                <div className="text-right">
-                  <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                    Anti-Sniping (+10s)
-                  </div>
-                  <div className="text-xs font-bold text-emerald-700 flex items-center justify-end gap-1">
-                    <Zap className="w-3.5 h-3.5 text-amber-500 fill-amber-500" />
-                    <span>{activeProduct.extensionCount} / {activeProduct.maxExtensions} Extensions</span>
-                  </div>
-                </div>
-
+              {/* Visual Countdown Timer with Anti-Sniping Urgency Color Progression */}
+              <div className="pb-2">
+                <AuctionCountdownTimer
+                  status={isPaused ? 'paused' : activeProduct.status}
+                  remainingSeconds={timeRemaining}
+                  totalDurationSeconds={activeProduct.durationSeconds}
+                  antiSnipingSeconds={10}
+                  extensionCount={activeProduct.extensionCount}
+                  maxExtensions={activeProduct.maxExtensions}
+                  isExtended={isExtended}
+                />
               </div>
-
-              {/* Anti-Sniping Alert Banner */}
-              <AnimatePresence>
-                {isExtended && (
-                  <motion.div
-                    initial={{ scale: 0.9, opacity: 0 }}
-                    animate={{ scale: 1, opacity: 1 }}
-                    exit={{ scale: 0.9, opacity: 0 }}
-                    className="my-3 py-2 px-3 rounded-xl bg-amber-500 text-white font-extrabold text-xs flex items-center justify-center gap-2 shadow-md animate-bounce"
-                  >
-                    <Zap className="w-4 h-4 fill-white" />
-                    <span>⚡ EXTENDED! New bid received in final seconds (+10s added)</span>
-                  </motion.div>
-                )}
-              </AnimatePresence>
 
               {/* Dominant Current Bid Display */}
               <div className="py-6 text-center">

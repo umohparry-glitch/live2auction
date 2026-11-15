@@ -44,8 +44,15 @@ export interface AuthRequest extends Request {
 
 export function isHttpsRequest(req: Request): boolean {
   const proto = req.headers['x-forwarded-proto'];
-  if (typeof proto === 'string' && proto.includes('https')) return true;
+  if (typeof proto === 'string' && proto.toLowerCase().includes('https')) return true;
+  if (req.headers['x-forwarded-ssl'] === 'on') return true;
   if (req.secure) return true;
+  const origin = req.headers.origin;
+  if (typeof origin === 'string' && origin.startsWith('https://')) return true;
+  const referer = req.headers.referer;
+  if (typeof referer === 'string' && referer.startsWith('https://')) return true;
+  const host = req.headers.host || '';
+  if (host.includes('.run.app') || host.includes('.web.app')) return true;
   return process.env.NODE_ENV === 'production';
 }
 
@@ -67,6 +74,7 @@ export function getSessionCookieOptions(
     httpOnly: true,
     secure: https,
     sameSite: (https ? 'none' : 'lax') as 'none' | 'lax',
+    ...(https ? { partitioned: true } : {}),
     path: '/',
     ...(maxAge ? { maxAge } : {}),
   };
@@ -77,9 +85,73 @@ export function clearSessionCookie(req: Request, res: Response) {
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
     secure: https,
-    sameSite: https ? 'none' : 'lax',
+    sameSite: (https ? 'none' : 'lax') as 'none' | 'lax',
+    ...(https ? { partitioned: true } : {}),
     path: '/',
   });
+}
+
+function isTransientDbError(err: any): boolean {
+  const msg = err?.message || '';
+  const code = err?.code || '';
+  return (
+    msg.includes('Connection terminated') ||
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ETIMEDOUT' ||
+    code === '57P01'
+  );
+}
+
+async function resolveSessionFromDb(rawToken: string) {
+  const tokenHash = hashToken(rawToken);
+  const now = new Date();
+
+  const [sessionRow] = await db
+    .select()
+    .from(sessions)
+    .where(
+      and(
+        eq(sessions.tokenHash, tokenHash),
+        isNull(sessions.revokedAt),
+        gt(sessions.expiresAt, now)
+      )
+    )
+    .limit(1);
+
+  if (!sessionRow) {
+    return { status: 'missing' as const };
+  }
+
+  const [userRow] = await db
+    .select({
+      id: users.id,
+      uid: users.uid,
+      fullName: users.fullName,
+      username: users.username,
+      email: users.email,
+      phone: users.phone,
+      avatarUrl: users.avatarUrl,
+      status: users.status,
+      emailVerified: users.emailVerified,
+      mustChangePassword: users.mustChangePassword,
+      isAdmin: users.isAdmin,
+      createdAt: users.createdAt,
+      lastLoginAt: users.lastLoginAt,
+    })
+    .from(users)
+    .where(eq(users.id, sessionRow.userId))
+    .limit(1);
+
+  if (!userRow || userRow.status !== 'active') {
+    await db
+      .update(sessions)
+      .set({ revokedAt: now })
+      .where(eq(sessions.id, sessionRow.id));
+    return { status: 'inactive' as const };
+  }
+
+  return { status: 'valid' as const, sessionRow, userRow, now };
 }
 
 export async function loadUserRolesAndPermissions(userId: number) {
@@ -127,54 +199,23 @@ export async function attachSession(req: AuthRequest, res: Response, next: NextF
       return next();
     }
 
-    const tokenHash = hashToken(rawToken);
-    const now = new Date();
+    let resolved;
+    try {
+      resolved = await resolveSessionFromDb(rawToken);
+    } catch (firstErr) {
+      if (isTransientDbError(firstErr)) {
+        resolved = await resolveSessionFromDb(rawToken);
+      } else {
+        throw firstErr;
+      }
+    }
 
-    const [sessionRow] = await db
-      .select()
-      .from(sessions)
-      .where(
-        and(
-          eq(sessions.tokenHash, tokenHash),
-          isNull(sessions.revokedAt),
-          gt(sessions.expiresAt, now)
-        )
-      )
-      .limit(1);
-
-    if (!sessionRow) {
+    if (resolved.status !== 'valid') {
       clearSessionCookie(req, res);
       return next();
     }
 
-    const [userRow] = await db
-      .select({
-        id: users.id,
-        uid: users.uid,
-        fullName: users.fullName,
-        username: users.username,
-        email: users.email,
-        phone: users.phone,
-        avatarUrl: users.avatarUrl,
-        status: users.status,
-        emailVerified: users.emailVerified,
-        mustChangePassword: users.mustChangePassword,
-        isAdmin: users.isAdmin,
-        createdAt: users.createdAt,
-        lastLoginAt: users.lastLoginAt,
-      })
-      .from(users)
-      .where(eq(users.id, sessionRow.userId))
-      .limit(1);
-
-    if (!userRow || userRow.status !== 'active') {
-      await db
-        .update(sessions)
-        .set({ revokedAt: now })
-        .where(eq(sessions.id, sessionRow.id));
-      clearSessionCookie(req, res);
-      return next();
-    }
+    const { sessionRow, userRow, now } = resolved;
 
     // Rotate session token every 15 minutes for sliding security
     const msSinceRotation = now.getTime() - new Date(sessionRow.lastRotatedAt).getTime();

@@ -34,6 +34,8 @@ async function startServer() {
     helmet({
       contentSecurityPolicy: false,
       crossOriginEmbedderPolicy: false,
+      crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
+      crossOriginResourcePolicy: { policy: 'cross-origin' },
       frameguard: false, // Allow embedding inside AI Studio preview iframe
     })
   );
