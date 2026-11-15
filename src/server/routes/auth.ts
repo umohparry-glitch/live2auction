@@ -17,7 +17,7 @@ import {
 } from '../../db/schema.ts';
 import { adminAuth } from '../../lib/firebase-admin.ts';
 import {
-  AuthRequest,
+  type AuthRequest,
   SESSION_COOKIE_NAME,
   clearSessionCookie,
   getClientIp,

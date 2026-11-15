@@ -16,6 +16,8 @@ export interface AuthUser {
   emailVerified: boolean;
   mustChangePassword: boolean;
   isAdmin: boolean;
+  canPostProducts?: boolean;
+  sellerApprovalRequested?: boolean;
   createdAt: string;
   lastLoginAt: string | null;
 }
@@ -44,6 +46,8 @@ export interface WebsiteSettingsData {
   requireEmailVerification: boolean;
   defaultBidIncrement: number;
   antiSnipingSeconds: number;
+  timeBetweenAuctionsMinutes?: number;
+  defaultSlotDurationMinutes?: number;
 }
 
 export type AuthModalMode = 'gate' | 'login' | 'register' | 'forgot' | 'reset' | 'verify';
@@ -208,10 +212,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       (payload: { userId: number; type: string; title: string; message: string }) => {
         if (userIdRef.current && payload.userId === userIdRef.current) {
           showToast(
-            payload.type === 'outbid' ? 'warning' : 'info',
+            payload.type === 'outbid' ? 'warning' : payload.type === 'auction_won' || payload.type === 'seller_approved' ? 'success' : 'info',
             payload.title,
             payload.message
           );
+          if (payload.type === 'seller_approved' || payload.type === 'seller_revoked') {
+            void refreshSession();
+          }
           if (
             typeof window !== 'undefined' &&
             'Notification' in window &&

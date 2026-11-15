@@ -28,12 +28,15 @@ import {
   Calendar
 } from 'lucide-react';
 import { useLiveAuction } from '../context/LiveAuctionContext';
+import { useAuth } from '../context/AuthContext';
+import { apiRequest } from '../services/api';
 import { motion, AnimatePresence } from 'motion/react';
 import { speechAnnouncer } from '../utils/speechAnnouncer';
 import { RecentBidsTicker } from './RecentBidsTicker';
 import { SlotProductQueue } from './SlotProductQueue';
 import { SlotWeekScheduleModal } from './SlotWeekScheduleModal';
 import { AuctionCountdownTimer } from './AuctionCountdownTimer';
+import { BidderTrustBadge, type BidderTrustProfile, tierFromScore } from './BidderTrustBadge';
 
 interface LiveAuctionRoomProps {
   openPreBidModal: (product: any) => void;
@@ -78,6 +81,8 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
     hostAction,
     isPaused
   } = useLiveAuction();
+  const { user } = useAuth();
+  const [dbTrustScores, setDbTrustScores] = useState<Record<string, BidderTrustProfile>>({});
 
   // Local state
   const [activeImageIndex, setActiveImageIndex] = useState(0);
@@ -154,6 +159,72 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
       speechAnnouncer.announceSold(activeProduct.winner.bidAmount, activeProduct.winner.nickname, activeProduct.title);
     }
   }, [activeProduct?.status, activeProduct?.winner, isVoiceAnnouncerEnabled, activeProduct?.title]);
+
+  // Sync real DB trust scores for signed-in user & any matching bidder handles
+  useEffect(() => {
+    const names = new Set<string>();
+    if (user?.username) names.add(user.username);
+    for (const b of bidHistory) {
+      const clean = b.maskedBidder.replace(/\s*\(Auto-Bid.*?\)\s*/gi, '').trim();
+      if (clean) names.add(clean);
+    }
+    if (names.size === 0) return;
+
+    const query = encodeURIComponent(Array.from(names).slice(0, 40).join(','));
+    apiRequest<{ trustScores: Record<string, BidderTrustProfile> }>(`/api/public/trust-scores?usernames=${query}`)
+      .then((res) => {
+        if (res?.trustScores) {
+          setDbTrustScores(res.trustScores);
+        }
+      })
+      .catch(() => {
+        // non-blocking
+      });
+  }, [user?.username, bidHistory.length]);
+
+  const getRoomBidderTrust = (rawHandle: string, isCurrentUser?: boolean): BidderTrustProfile => {
+    const cleanHandle = rawHandle.replace(/\s*\(Auto-Bid.*?\)\s*/gi, '').trim();
+    const targetUsername = isCurrentUser && user?.username ? user.username : cleanHandle;
+    const dbProfile = dbTrustScores[targetUsername.toLowerCase()];
+    if (dbProfile) return dbProfile;
+
+    // Deterministic completion-based score from active session room completions
+    let completedWins = 0;
+    let completedAuctions = 0;
+    categoryRooms.forEach((room) => {
+      room.slots.forEach((slot) => {
+        slot.products.forEach((p) => {
+          if (p.status === 'sold') {
+            if (p.winner?.nickname === cleanHandle || p.winner?.nickname === targetUsername) {
+              completedWins += 1;
+              completedAuctions += 1;
+            }
+          }
+        });
+      });
+    });
+
+    const bidsPlaced = bidHistory.filter(
+      (b) => b.maskedBidder.replace(/\s*\(Auto-Bid.*?\)\s*/gi, '').trim() === cleanHandle
+    ).length;
+
+    const score = Math.max(
+      70,
+      Math.min(100, 75 + Math.min(15, completedWins * 8) + Math.min(10, bidsPlaced * 2))
+    );
+
+    return {
+      username: targetUsername,
+      score,
+      tier: tierFromScore(score),
+      completedWins,
+      totalWins: completedWins,
+      completedAuctionsCount: completedAuctions,
+      totalBidsCount: bidsPlaced,
+      completionRate: completedWins > 0 ? 100 : null,
+      emailVerified: true,
+    };
+  };
 
   // Trigger pulse animation when current bid changes
   useEffect(() => {
@@ -295,8 +366,8 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
       </div>
 
       {/* ================= CATEGORY LIVE ROOMS CHANNEL BAR ================= */}
-      <div className="bg-slate-900 text-white border-b border-slate-800 px-4 py-2.5 shadow-xs">
-        <div className="max-w-7xl mx-auto flex items-center justify-between gap-4">
+      <div className="bg-slate-900 text-white border-b border-slate-800 px-3 sm:px-4 py-2.5 shadow-xs">
+        <div className="max-w-7xl mx-auto flex flex-wrap sm:flex-nowrap items-center justify-between gap-2 sm:gap-4 min-w-0">
           <div className="flex items-center gap-2 shrink-0">
             <span className="flex h-2 w-2 relative">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
@@ -369,7 +440,7 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
                   {activeRoom.slots.length} Auction Slots Today
                 </span>
               </div>
-              <p className="text-[11px] text-slate-500 hidden sm:block">
+              <p className="text-[11px] text-slate-500">
                 Each slot features a distinct item catalog quota allocated for today.
               </p>
             </div>
@@ -442,15 +513,15 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
 
         {/* Slot On-Air Item Tracker Banner */}
         <div className="max-w-7xl mx-auto mt-2 pt-2 border-t border-slate-200/80 flex flex-wrap items-center justify-between gap-2 text-xs">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-emerald-600 text-white tracking-wider">
               NOW BROADCASTING: {activeSlot.code}
             </span>
             <span className="font-bold text-slate-800">
               Item #{activeProductIndex + 1} of {activeSlot.targetItemCount} items for today
             </span>
-            <span className="text-slate-400 hidden sm:inline">•</span>
-            <span className="text-slate-500 hidden sm:inline">
+            <span className="text-slate-400">•</span>
+            <span className="text-slate-500">
               Slot Time Window: {activeSlot.scheduledStartTime} – {activeSlot.scheduledEndTime}
             </span>
           </div>
@@ -470,12 +541,12 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
       <div className="border-b border-slate-200 bg-slate-50/60 px-4 py-2.5">
         <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
           
-          <div className="flex items-center gap-3">
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-rose-600 text-white tracking-wider">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-rose-600 text-white tracking-wider shrink-0">
               <span className="w-2 h-2 rounded-full bg-white animate-ping" />
               LIVE ROOM
             </span>
-            <h1 className="text-sm sm:text-base font-extrabold text-slate-900 truncate max-w-[260px] sm:max-w-md">
+            <h1 className="text-sm sm:text-base font-extrabold text-slate-900 truncate min-w-0">
               {currentEvent.title}
             </h1>
           </div>
@@ -526,17 +597,17 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
               <Eye className="w-3.5 h-3.5 text-emerald-600" />
               <span>{currentEvent.viewerCount.toLocaleString()} watching</span>
             </div>
-            <div className="hidden sm:flex items-center gap-1.5 bg-white px-2.5 py-1 rounded-md border border-slate-200 shadow-2xs">
+            <div className="flex items-center gap-1.5 bg-white px-2.5 py-1.5 rounded-md border border-slate-200 shadow-2xs">
               <Users className="w-3.5 h-3.5 text-blue-600" />
               <span>{currentEvent.activeBiddersCount} bidders</span>
             </div>
             <button
               onClick={handleShare}
-              className="flex items-center gap-1 bg-white hover:bg-slate-100 text-slate-700 px-2.5 py-1 rounded-md border border-slate-200 transition"
+              className="flex items-center gap-1 bg-white hover:bg-slate-100 text-slate-700 px-2.5 py-1.5 rounded-md border border-slate-200 transition cursor-pointer"
               title="Share live auction"
             >
               {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Share2 className="w-3.5 h-3.5" />}
-              <span className="hidden sm:inline">{copiedLink ? 'Copied!' : 'Share'}</span>
+              <span>{copiedLink ? 'Copied!' : 'Share'}</span>
             </button>
           </div>
 
@@ -732,11 +803,22 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
                     <h3 className="text-xl font-extrabold text-slate-900">
                       {activeProduct.status === 'sold' ? 'SOLD!' : 'AUCTION ENDED'}
                     </h3>
-                    <p className="text-sm text-slate-600 mt-1 max-w-xs">
-                      {activeProduct.winner 
-                        ? `Won by ${activeProduct.winner.nickname} for ₦${activeProduct.winner.bidAmount.toLocaleString()}`
-                        : 'Moving to the next scheduled product in queue...'}
-                    </p>
+                    <div className="text-sm text-slate-600 mt-1 max-w-xs flex flex-wrap items-center justify-center gap-1.5">
+                      {activeProduct.winner ? (
+                        <>
+                          <span>
+                            Won by {activeProduct.winner.nickname} for ₦
+                            {activeProduct.winner.bidAmount.toLocaleString()}
+                          </span>
+                          <BidderTrustBadge
+                            profile={getRoomBidderTrust(activeProduct.winner.nickname)}
+                            compact
+                          />
+                        </>
+                      ) : (
+                        <span>Moving to the next scheduled product in queue...</span>
+                      )}
+                    </div>
                     <p className="text-xs font-bold text-emerald-700 mt-3 uppercase tracking-wider">
                       Next Item Loading In {transitionCountdown}s...
                     </p>
@@ -790,10 +872,10 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
                       initial={{ opacity: 0, y: -4 }}
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0 }}
-                      className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 text-xs font-bold mt-2 shadow-2xs"
+                      className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 text-xs font-bold mt-2 shadow-2xs max-w-full"
                     >
                       <Volume2 className="w-3.5 h-3.5 text-emerald-600 animate-pulse shrink-0" />
-                      <span className="max-w-[260px] sm:max-w-xs truncate">
+                      <span className="truncate">
                         🎙️ Voice: {currentSpokenPhrase}
                       </span>
                     </motion.div>
@@ -926,11 +1008,15 @@ export const LiveAuctionRoom: React.FC<LiveAuctionRoomProps> = ({
                           : 'bg-slate-50/70 border-slate-100'
                       }`}
                     >
-                      <div className="flex items-center gap-2">
-                        <span className={`w-2 h-2 rounded-full ${bid.isCurrentUser ? 'bg-emerald-600' : 'bg-slate-400'}`} />
-                        <span className="text-slate-800 font-semibold">
-                          {bid.maskedBidder}
+                      <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
+                        <span className={`w-2 h-2 rounded-full shrink-0 ${bid.isCurrentUser ? 'bg-emerald-600' : 'bg-slate-400'}`} />
+                        <span className="text-slate-800 font-semibold truncate">
+                          {bid.isCurrentUser && user?.username ? `@${user.username}` : bid.maskedBidder}
                         </span>
+                        <BidderTrustBadge
+                          profile={getRoomBidderTrust(bid.maskedBidder, bid.isCurrentUser)}
+                          compact
+                        />
                         {bid.isProxy && (
                           <span className="text-[10px] bg-blue-100 text-blue-700 px-1 py-0.2 rounded font-bold">
                             PROXY

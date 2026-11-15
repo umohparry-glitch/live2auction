@@ -403,9 +403,9 @@ export const LiveAuctionHub: React.FC<LiveAuctionHubProps> = ({
 
             {/* Sort Selector */}
             <div className="flex items-center gap-2 w-full sm:w-auto shrink-0">
-              <ArrowUpDown className="w-4 h-4 text-slate-500 shrink-0 hidden sm:inline" />
-              <div className="flex items-center gap-1 w-full sm:w-auto">
-                <span className="text-xs text-slate-500 font-semibold whitespace-nowrap hidden md:inline">
+              <ArrowUpDown className="w-4 h-4 text-slate-500 shrink-0" />
+              <div className="flex items-center gap-1.5 w-full sm:w-auto">
+                <span className="text-xs text-slate-500 font-semibold whitespace-nowrap">
                   Sort:
                 </span>
                 <select

@@ -10,6 +10,7 @@ import {
   KeyRound,
   LayoutDashboard,
   LogOut,
+  PackagePlus,
   Settings,
   ShieldAlert,
   Trophy,
@@ -18,6 +19,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { apiRequest } from '../services/api';
+import { PostProductBiddingView } from './PostProductBiddingView';
 
 type DashboardTab =
   | 'overview'
@@ -26,6 +28,7 @@ type DashboardTab =
   | 'winning_bids'
   | 'lost_auctions'
   | 'watchlist'
+  | 'post_product'
   | 'history'
   | 'notifications'
   | 'settings'
@@ -39,6 +42,7 @@ interface DashboardPayload {
     totalBidsPlaced: number;
     watchlistCount: number;
     activeSessionsCount: number;
+    submittedProductsCount?: number;
   };
   activeBids: any[];
   winningBids: any[];
@@ -46,6 +50,7 @@ interface DashboardPayload {
   watchlist: any[];
   bidHistory: any[];
   notifications: any[];
+  myProducts?: any[];
 }
 
 interface UserDashboardProps {
@@ -254,6 +259,12 @@ export const UserDashboard: React.FC<UserDashboardProps> = ({
       icon: <Bookmark className="w-4 h-4" />,
       count: data?.stats.watchlistCount,
     },
+    {
+      key: 'post_product',
+      label: 'Post Product for Bidding',
+      icon: <PackagePlus className="w-4 h-4" />,
+      count: data?.stats.submittedProductsCount,
+    },
     { key: 'history', label: 'Auction History', icon: <History className="w-4 h-4" /> },
     {
       key: 'notifications',
@@ -266,25 +277,25 @@ export const UserDashboard: React.FC<UserDashboardProps> = ({
   ];
 
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-8 space-y-5 sm:space-y-6">
       {/* User Summary Banner */}
-      <div className="border border-slate-200 rounded-2xl p-6 bg-white flex flex-col md:flex-row md:items-center justify-between gap-6">
-        <div className="flex items-center gap-4">
+      <div className="border border-slate-200 rounded-2xl p-4 sm:p-6 bg-white flex flex-col md:flex-row md:items-center justify-between gap-4 sm:gap-6">
+        <div className="flex items-center gap-3.5 sm:gap-4 min-w-0">
           {user.avatarUrl ? (
             <img
               src={user.avatarUrl}
               alt={user.username}
-              className="w-16 h-16 rounded-full object-cover border border-slate-200"
+              className="w-14 h-14 sm:w-16 sm:h-16 rounded-full object-cover border border-slate-200 shrink-0"
               referrerPolicy="no-referrer"
             />
           ) : (
-            <div className="w-16 h-16 rounded-full bg-emerald-600 text-white flex items-center justify-center text-2xl font-bold shrink-0">
+            <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-full bg-emerald-600 text-white flex items-center justify-center text-xl sm:text-2xl font-bold shrink-0">
               {user.username[0]?.toUpperCase()}
             </div>
           )}
-          <div>
-            <div className="flex items-center gap-2">
-              <h1 className="text-xl font-bold text-slate-900">{user.fullName}</h1>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+              <h1 className="text-lg sm:text-xl font-bold text-slate-900 truncate">{user.fullName}</h1>
               <span className="text-xs text-slate-500">@{user.username}</span>
             </div>
             <div className="text-xs text-slate-500 mt-1">
@@ -303,7 +314,7 @@ export const UserDashboard: React.FC<UserDashboardProps> = ({
           </div>
         </div>
 
-        <div className="grid grid-cols-3 gap-6 text-center md:text-right border-t md:border-t-0 pt-4 md:pt-0 border-slate-100">
+        <div className="grid grid-cols-3 gap-3 sm:gap-6 text-center md:text-right border-t md:border-t-0 pt-4 md:pt-0 border-slate-100">
           <div>
             <div className="text-xs text-slate-500">Active Bids</div>
             <div className="text-xl font-bold text-slate-900 tabular-nums">
@@ -325,21 +336,21 @@ export const UserDashboard: React.FC<UserDashboardProps> = ({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Sidebar Navigation */}
-        <aside className="lg:col-span-3 space-y-1">
-          <div className="border border-slate-200 rounded-2xl p-2 bg-white space-y-1">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6">
+        {/* Mobile Horizontal Scrollable Tabs + Desktop Vertical Sidebar */}
+        <aside className="lg:col-span-3">
+          <div className="border border-slate-200 rounded-2xl p-2 bg-white flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto no-scrollbar">
             {navItems.map((item) => (
               <button
                 key={item.key}
                 onClick={() => setTab(item.key)}
-                className={`w-full px-3 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-between transition cursor-pointer ${
+                className={`w-auto lg:w-full px-3 py-2.5 min-h-[40px] rounded-xl text-xs font-semibold flex items-center justify-between gap-2 whitespace-nowrap shrink-0 transition cursor-pointer ${
                   tab === item.key
                     ? 'bg-emerald-600 text-white'
                     : 'text-slate-700 hover:bg-slate-50'
                 }`}
               >
-                <span className="flex items-center gap-2.5">
+                <span className="flex items-center gap-2">
                   {item.icon}
                   <span>{item.label}</span>
                 </span>
@@ -355,13 +366,13 @@ export const UserDashboard: React.FC<UserDashboardProps> = ({
               </button>
             ))}
 
-            <div className="pt-2 mt-2 border-t border-slate-100">
+            <div className="lg:pt-2 lg:mt-2 lg:border-t lg:border-slate-100 shrink-0">
               <button
                 onClick={async () => {
                   await logout();
                   onLogoutComplete();
                 }}
-                className="w-full px-3 py-2.5 rounded-xl text-xs font-semibold text-rose-600 hover:bg-rose-50 flex items-center gap-2.5 cursor-pointer"
+                className="w-auto lg:w-full px-3 py-2.5 min-h-[40px] rounded-xl text-xs font-semibold text-rose-600 hover:bg-rose-50 flex items-center gap-2 whitespace-nowrap cursor-pointer"
               >
                 <LogOut className="w-4 h-4" />
                 <span>Logout</span>
@@ -371,7 +382,7 @@ export const UserDashboard: React.FC<UserDashboardProps> = ({
         </aside>
 
         {/* Main Content Viewport */}
-        <section className="lg:col-span-9 border border-slate-200 rounded-2xl p-6 bg-white min-h-[420px]">
+        <section className="lg:col-span-9 border border-slate-200 rounded-2xl p-4 sm:p-6 bg-white min-h-[420px] min-w-0">
           {loading ? (
             <div className="py-16 text-center text-sm text-slate-500">
               Loading your account activity...
@@ -670,6 +681,13 @@ export const UserDashboard: React.FC<UserDashboardProps> = ({
                     </div>
                   )}
                 </div>
+              )}
+
+              {tab === 'post_product' && (
+                <PostProductBiddingView
+                  embeddedInDashboard
+                  onOpenAuction={onOpenAuction}
+                />
               )}
 
               {tab === 'history' && (

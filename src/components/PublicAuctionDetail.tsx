@@ -13,6 +13,7 @@ import { useAuth } from '../context/AuthContext';
 import { apiRequest } from '../services/api';
 import { PublicAuctionItem } from './PublicMarketplace';
 import { AuctionCountdownTimer } from './AuctionCountdownTimer';
+import { BidderTrustBadge, type BidderTrustProfile } from './BidderTrustBadge';
 
 interface BidRow {
   id: number;
@@ -20,6 +21,7 @@ interface BidRow {
   amount: number;
   isProxy: boolean;
   createdAt: string;
+  trustProfile?: BidderTrustProfile | null;
 }
 
 interface DiscussionRow {
@@ -27,6 +29,7 @@ interface DiscussionRow {
   username: string;
   message: string;
   createdAt: string;
+  trustProfile?: BidderTrustProfile | null;
 }
 
 interface PublicAuctionDetailProps {
@@ -48,6 +51,7 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
   const [bidding, setBidding] = useState(false);
   const [loading, setLoading] = useState(true);
   const [isExtendedFlash, setIsExtendedFlash] = useState(false);
+  const [trustScores, setTrustScores] = useState<Record<string, BidderTrustProfile>>({});
 
   const loadDetail = async () => {
     try {
@@ -55,10 +59,14 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
         auction: PublicAuctionItem;
         bids: BidRow[];
         discussions: DiscussionRow[];
+        trustScores?: Record<string, BidderTrustProfile>;
       }>(`/api/public/auctions/${auctionId}`);
       setAuction(data.auction);
       setBids(data.bids || []);
       setDiscussions(data.discussions || []);
+      if (data.trustScores) {
+        setTrustScores(data.trustScores);
+      }
       const minNext =
         data.auction.bidsCount === 0
           ? data.auction.startingPrice
@@ -98,6 +106,13 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
           : null
       );
       setBids((prev) => [payload.bid, ...prev]);
+      if (payload.bid?.trustProfile && payload.bid?.username) {
+        setTrustScores((prev) => ({
+          ...prev,
+          [payload.bid.username.toLowerCase()]: payload.bid.trustProfile,
+          [payload.bid.username]: payload.bid.trustProfile,
+        }));
+      }
     };
 
     const onDiscussion = (payload: any) => {
@@ -107,6 +122,13 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
           ? prev
           : [...prev, payload.discussion]
       );
+      if (payload.discussion?.trustProfile && payload.discussion?.username) {
+        setTrustScores((prev) => ({
+          ...prev,
+          [payload.discussion.username.toLowerCase()]: payload.discussion.trustProfile,
+          [payload.discussion.username]: payload.discussion.trustProfile,
+        }));
+      }
     };
 
     const onClosed = (payload: any) => {
@@ -294,15 +316,21 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
                   No questions or comments yet. Ask about inspection or specs!
                 </p>
               ) : (
-                discussions.map((d) => (
-                  <div key={d.id} className="text-xs bg-slate-50 rounded-lg px-3 py-2">
-                    <div className="flex items-center justify-between text-slate-500 mb-0.5">
-                      <span className="font-semibold text-slate-900">@{d.username}</span>
-                      <span>{new Date(d.createdAt).toLocaleTimeString()}</span>
+                discussions.map((d) => {
+                  const tp = d.trustProfile || trustScores[d.username.toLowerCase()] || null;
+                  return (
+                    <div key={d.id} className="text-xs bg-slate-50 rounded-lg px-3 py-2">
+                      <div className="flex items-center justify-between gap-2 text-slate-500 mb-0.5">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="font-semibold text-slate-900 truncate">@{d.username}</span>
+                          <BidderTrustBadge profile={tp} compact />
+                        </div>
+                        <span className="shrink-0">{new Date(d.createdAt).toLocaleTimeString()}</span>
+                      </div>
+                      <p className="text-slate-700">{d.message}</p>
                     </div>
-                    <p className="text-slate-700">{d.message}</p>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
 
@@ -387,8 +415,13 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
             {auction.status === 'live' ? (
               <div className="space-y-3">
                 {user && auction.winnerUsername === user.username ? (
-                  <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-800">
-                    You are currently the highest bidder (@{user.username}).
+                  <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-800 flex items-center justify-between gap-2 flex-wrap">
+                    <span>You are currently the highest bidder (@{user.username}).</span>
+                    <BidderTrustBadge
+                      profile={trustScores[user.username.toLowerCase()] || null}
+                      compact
+                      showTier
+                    />
                   </div>
                 ) : null}
 
@@ -403,19 +436,19 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
                   </span>
                 </button>
 
-                <div className="flex gap-2">
+                <div className="flex flex-wrap sm:flex-nowrap gap-2">
                   <input
                     type="number"
                     min={minNextBid}
                     step={auction.bidIncrement}
                     value={customBid}
                     onChange={(e) => setCustomBid(e.target.value)}
-                    className="flex-1 px-3 py-2.5 border border-slate-300 rounded-lg text-sm font-mono tabular-nums focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                    className="flex-1 min-w-0 px-3 py-2.5 border border-slate-300 rounded-lg text-sm font-mono tabular-nums focus:outline-none focus:ring-2 focus:ring-emerald-600"
                   />
                   <button
                     onClick={() => handlePlaceBid(Number(customBid))}
                     disabled={bidding}
-                    className="px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg transition cursor-pointer"
+                    className="px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg transition cursor-pointer shrink-0 whitespace-nowrap"
                   >
                     Place Custom Bid
                   </button>
@@ -429,10 +462,22 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
             ) : auction.status === 'ended' ? (
               <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-1">
                 <div className="font-semibold text-slate-900">Auction Completed</div>
-                <div className="text-slate-600">
-                  {auction.winnerUsername
-                    ? `Winner: @${auction.winnerUsername} at ₦${(auction.winningBidAmount || auction.currentBid).toLocaleString()}`
-                    : 'Closed with no winning bids.'}
+                <div className="text-slate-600 flex items-center gap-1.5 flex-wrap">
+                  {auction.winnerUsername ? (
+                    <>
+                      <span>
+                        Winner: @{auction.winnerUsername} at ₦
+                        {(auction.winningBidAmount || auction.currentBid).toLocaleString()}
+                      </span>
+                      <BidderTrustBadge
+                        profile={trustScores[auction.winnerUsername.toLowerCase()] || null}
+                        compact
+                        showTier
+                      />
+                    </>
+                  ) : (
+                    <span>Closed with no winning bids.</span>
+                  )}
                 </div>
               </div>
             ) : (
@@ -449,24 +494,28 @@ export const PublicAuctionDetail: React.FC<PublicAuctionDetailProps> = ({
                 <p className="text-xs text-slate-400">No bids placed yet. Be the first!</p>
               ) : (
                 <div className="divide-y divide-slate-100 max-h-52 overflow-y-auto">
-                  {bids.map((b, i) => (
-                    <div key={b.id} className="py-2 flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-2">
-                        <span className="font-semibold text-slate-900">
-                          @{b.username}
-                          {i === 0 ? ' (Lead)' : ''}
-                        </span>
+                  {bids.map((b, i) => {
+                    const tp = b.trustProfile || trustScores[b.username.toLowerCase()] || null;
+                    return (
+                      <div key={b.id} className="py-2 flex items-center justify-between gap-2 text-xs">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="font-semibold text-slate-900 truncate">
+                            @{b.username}
+                            {i === 0 ? ' (Lead)' : ''}
+                          </span>
+                          <BidderTrustBadge profile={tp} compact />
+                        </div>
+                        <div className="text-right tabular-nums shrink-0">
+                          <span className="font-semibold text-slate-900">
+                            ₦{b.amount.toLocaleString()}
+                          </span>
+                          <span className="text-slate-400 ml-2">
+                            {new Date(b.createdAt).toLocaleTimeString()}
+                          </span>
+                        </div>
                       </div>
-                      <div className="text-right tabular-nums">
-                        <span className="font-semibold text-slate-900">
-                          ₦{b.amount.toLocaleString()}
-                        </span>
-                        <span className="text-slate-400 ml-2">
-                          {new Date(b.createdAt).toLocaleTimeString()}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>

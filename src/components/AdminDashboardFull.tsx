@@ -1,7 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpToLine,
   BarChart3,
+  Bell,
   CheckCircle2,
   Edit3,
   Gavel,
@@ -15,23 +19,27 @@ import {
   ShieldAlert,
   ShieldCheck,
   Trash2,
+  Trophy,
+  Upload,
   UserPlus,
   Users,
   X,
 } from 'lucide-react';
-import {
-  Bar,
-  BarChart,
-  CartesianGrid,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts';
 import { useAuth, WebsiteSettingsData } from '../context/AuthContext';
 import { apiRequest } from '../services/api';
+import { readAndCompressImageFiles } from '../utils/imageUpload';
+import { AdminAnalyticsCharts } from './AdminAnalyticsCharts';
 
-type AdminTab = 'overview' | 'users' | 'admins' | 'auctions' | 'categories' | 'logs' | 'settings';
+type AdminTab =
+  | 'overview'
+  | 'users'
+  | 'admins'
+  | 'auctions'
+  | 'winners'
+  | 'alerts'
+  | 'categories'
+  | 'logs'
+  | 'settings';
 
 const STUDIO_IMAGE_PRESETS = [
   { label: 'Flagship Phone', url: '/src/assets/images/auction_iphone_pro_1794582939193.jpg' },
@@ -53,6 +61,7 @@ export const AdminDashboardFull: React.FC = () => {
     refreshSetupStatus,
     refreshSettings,
     showToast,
+    socket,
   } = useAuth();
 
   // Setup / Login gate state when unauthenticated
@@ -105,8 +114,12 @@ export const AdminDashboardFull: React.FC = () => {
   const [editAdminTarget, setEditAdminTarget] = useState<any | null>(null);
   const [logsList, setLogsList] = useState<any[]>([]);
 
-  // Auctions & Categories state
+  // Auctions, Approvals, Queue Ordering & Categories state
   const [auctionsList, setAuctionsList] = useState<any[]>([]);
+  const [auctionFilter, setAuctionFilter] = useState<'all' | 'pending' | 'live' | 'scheduled' | 'ended'>('all');
+  const [reorderingSaving, setReorderingSaving] = useState(false);
+  const [rejectProductTarget, setRejectProductTarget] = useState<any | null>(null);
+  const [rejectReasonInput, setRejectReasonInput] = useState('');
   const [categoriesList, setCategoriesList] = useState<any[]>([]);
   const [showAuctionModal, setShowAuctionModal] = useState(false);
   const [editingAuctionId, setEditingAuctionId] = useState<number | null>(null);
@@ -127,6 +140,8 @@ export const AdminDashboardFull: React.FC = () => {
     startTime: new Date().toISOString().slice(0, 16),
     endTime: new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 16),
     isFeatured: true,
+    putFirst: false,
+    queueOrder: '10',
     images: [STUDIO_IMAGE_PRESETS[0].url],
     newImageUrl: '',
     specsText: '',
@@ -136,6 +151,11 @@ export const AdminDashboardFull: React.FC = () => {
   );
   const [newCategoryName, setNewCategoryName] = useState('');
   const [newCategoryDesc, setNewCategoryDesc] = useState('');
+
+  // Winners & Admin Notifications state
+  const [winnersList, setWinnersList] = useState<any[]>([]);
+  const [adminAlerts, setAdminAlerts] = useState<any[]>([]);
+  const [unreadAlertsCount, setUnreadAlertsCount] = useState(0);
 
   // Website Settings state
   const [settingsForm, setSettingsForm] = useState<WebsiteSettingsData | null>(null);
@@ -149,6 +169,18 @@ export const AdminDashboardFull: React.FC = () => {
     confirmPassword: '',
   });
   const [savingMyPwd, setSavingMyPwd] = useState(false);
+
+  const loadAdminAlerts = async () => {
+    try {
+      const res = await apiRequest<{ notifications: any[]; unreadCount: number }>(
+        '/api/admin/notifications'
+      );
+      setAdminAlerts(res.notifications || []);
+      setUnreadAlertsCount(res.unreadCount || 0);
+    } catch {
+      // ignore
+    }
+  };
 
   const loadTabData = async (currentTab: AdminTab) => {
     try {
@@ -173,6 +205,11 @@ export const AdminDashboardFull: React.FC = () => {
         ]);
         setAuctionsList(aucs.auctions);
         setCategoriesList(cats.categories);
+      } else if (currentTab === 'winners' && hasPermission('manage_bids')) {
+        const res = await apiRequest<{ winners: any[] }>('/api/admin/winners');
+        setWinnersList(res.winners || []);
+      } else if (currentTab === 'alerts') {
+        await loadAdminAlerts();
       } else if (currentTab === 'categories' && hasPermission('manage_categories')) {
         const cats = await apiRequest<{ categories: any[] }>('/api/admin/categories');
         setCategoriesList(cats.categories);
@@ -193,8 +230,36 @@ export const AdminDashboardFull: React.FC = () => {
   useEffect(() => {
     if (isAdmin && !user?.mustChangePassword) {
       loadTabData(tab);
+      loadAdminAlerts();
     }
   }, [tab, isAdmin, user?.mustChangePassword]);
+
+  useEffect(() => {
+    if (!socket || !isAdmin) return;
+    const onAdminEvent = () => {
+      void loadAdminAlerts();
+      if (tab === 'overview' || tab === 'winners' || tab === 'auctions' || tab === 'users') {
+        void loadTabData(tab);
+      }
+    };
+    const onOverviewActivity = () => {
+      if (tab === 'overview') {
+        void loadTabData('overview');
+      }
+    };
+    socket.on('notification:admin', onAdminEvent);
+    socket.on('auction:closed', onAdminEvent);
+    socket.on('slots:updated', onAdminEvent);
+    socket.on('auction:bid_placed', onOverviewActivity);
+    socket.on('auction:discussion', onOverviewActivity);
+    return () => {
+      socket.off('notification:admin', onAdminEvent);
+      socket.off('auction:closed', onAdminEvent);
+      socket.off('slots:updated', onAdminEvent);
+      socket.off('auction:bid_placed', onOverviewActivity);
+      socket.off('auction:discussion', onOverviewActivity);
+    };
+  }, [socket, isAdmin, tab]);
 
   // Initial Setup submit for 'damwad' when INITIAL_ADMIN_PASSWORD wasn't provided in env
   const handleOneTimeSetup = async (e: React.FormEvent) => {
@@ -422,6 +487,7 @@ export const AdminDashboardFull: React.FC = () => {
           phone: editUserTarget.phone,
           status: editUserTarget.status,
           emailVerified: editUserTarget.emailVerified,
+          canPostProducts: Boolean(editUserTarget.canPostProducts),
         }),
       });
       showToast('success', 'User Updated', `Saved changes for @${editUserTarget.username}`);
@@ -429,6 +495,26 @@ export const AdminDashboardFull: React.FC = () => {
       loadTabData('users');
     } catch (err: any) {
       showToast('error', 'Error', err?.message || 'Failed to save user.');
+    }
+  };
+
+  const handleToggleUserPostingPermission = async (u: any) => {
+    const nextVal = !Boolean(u.canPostProducts);
+    try {
+      await apiRequest(`/api/admin/users/${u.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ canPostProducts: nextVal }),
+      });
+      showToast(
+        'success',
+        nextVal ? 'User Approved to Post' : 'Posting Permission Revoked',
+        nextVal
+          ? `@${u.username} can now post products for bidding.`
+          : `Revoked product posting permission for @${u.username}.`
+      );
+      loadTabData('users');
+    } catch (err: any) {
+      showToast('error', 'Error', err?.message || 'Unable to update posting permission.');
     }
   };
 
@@ -517,6 +603,24 @@ export const AdminDashboardFull: React.FC = () => {
     }
   };
 
+  const handleAdminUploadImages = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0) return;
+    try {
+      const uploaded = await readAndCompressImageFiles(e.target.files);
+      if (uploaded.length > 0) {
+        setAuctionForm((prev) => ({
+          ...prev,
+          images: [...prev.images, ...uploaded].slice(0, 8),
+        }));
+        showToast('success', 'Images Added', `Uploaded ${uploaded.length} product photo(s).`);
+      }
+    } catch (err: any) {
+      showToast('error', 'Upload Failed', err?.message || 'Unable to read image files.');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
   const handleSaveAuction = async (e: React.FormEvent) => {
     e.preventDefault();
     const payload = {
@@ -536,6 +640,8 @@ export const AdminDashboardFull: React.FC = () => {
       startTime: new Date(auctionForm.startTime).toISOString(),
       endTime: new Date(auctionForm.endTime).toISOString(),
       isFeatured: auctionForm.isFeatured,
+      putFirst: auctionForm.putFirst,
+      queueOrder: Number(auctionForm.queueOrder) || 100,
       images: auctionForm.images,
       specs: auctionForm.specsText
         .split('\n')
@@ -565,6 +671,102 @@ export const AdminDashboardFull: React.FC = () => {
     }
   };
 
+  const handleReorderAuction = async (auctionId: number, direction: 'first' | 'up' | 'down') => {
+    const idx = auctionsList.findIndex((a) => a.id === auctionId);
+    if (idx === -1) return;
+    const copy = [...auctionsList];
+    const [item] = copy.splice(idx, 1);
+
+    if (direction === 'first') {
+      copy.unshift(item);
+    } else if (direction === 'up' && idx > 0) {
+      copy.splice(idx - 1, 0, item);
+    } else if (direction === 'down' && idx < auctionsList.length - 1) {
+      copy.splice(idx + 1, 0, item);
+    } else {
+      return;
+    }
+
+    setAuctionsList(copy.map((a, i) => ({ ...a, queueOrder: i + 1 })));
+    setReorderingSaving(true);
+    try {
+      await apiRequest('/api/admin/auctions/reorder', {
+        method: 'PUT',
+        body: JSON.stringify({ orderedIds: copy.map((a) => a.id) }),
+      });
+      showToast('success', 'Display Order Saved', 'Product order updated for homepage & catalog.');
+    } catch (err: any) {
+      showToast('error', 'Reorder Failed', err?.message || 'Could not save order.');
+      loadTabData('auctions');
+    } finally {
+      setReorderingSaving(false);
+    }
+  };
+
+  const handleApproveProduct = async (auctionId: number, targetStatus: 'live' | 'scheduled') => {
+    try {
+      await apiRequest(`/api/admin/auctions/${auctionId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ approvalStatus: 'approved', status: targetStatus }),
+      });
+      showToast(
+        'success',
+        'Product Approved',
+        `Product approved and set to ${targetStatus}. Seller notified.`
+      );
+      loadTabData('auctions');
+    } catch (err: any) {
+      showToast('error', 'Error', err?.message || 'Failed to approve product.');
+    }
+  };
+
+  const handleConfirmRejectProduct = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!rejectProductTarget) return;
+    try {
+      await apiRequest(`/api/admin/auctions/${rejectProductTarget.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          approvalStatus: 'rejected',
+          rejectionReason: rejectReasonInput.trim() || 'Does not meet listing guidelines.',
+          status: 'draft',
+        }),
+      });
+      showToast('info', 'Product Rejected', 'Seller has been notified.');
+      setRejectProductTarget(null);
+      setRejectReasonInput('');
+      loadTabData('auctions');
+    } catch (err: any) {
+      showToast('error', 'Error', err?.message || 'Failed to reject product.');
+    }
+  };
+
+  const handleUpdateWinnerStatus = async (auctionId: number, winnerStatus: string) => {
+    try {
+      await apiRequest(`/api/admin/winners/${auctionId}/status`, {
+        method: 'PATCH',
+        body: JSON.stringify({ winnerStatus }),
+      });
+      showToast('success', 'Winner Status Updated', `Marked settlement as ${winnerStatus}.`);
+      loadTabData('winners');
+    } catch (err: any) {
+      showToast('error', 'Error', err?.message || 'Failed to update status.');
+    }
+  };
+
+  const handleNotifyWinnerAndAdmins = async (auctionId: number) => {
+    try {
+      const res = await apiRequest<{ message: string }>(`/api/admin/winners/${auctionId}/notify`, {
+        method: 'POST',
+      });
+      showToast('success', 'Notifications Dispatched', res.message);
+      loadTabData('winners');
+      void loadAdminAlerts();
+    } catch (err: any) {
+      showToast('error', 'Notification Failed', err?.message || 'Unable to notify winner.');
+    }
+  };
+
   const handleAuctionAction = async (auctionId: number, status: string) => {
     try {
       await apiRequest(`/api/admin/auctions/${auctionId}`, {
@@ -573,6 +775,7 @@ export const AdminDashboardFull: React.FC = () => {
       });
       showToast('success', 'Auction Status Updated', `Auction marked as ${status}.`);
       loadTabData('auctions');
+      void loadAdminAlerts();
     } catch (err: any) {
       showToast('error', 'Error', err?.message || 'Action failed.');
     }
@@ -668,6 +871,8 @@ export const AdminDashboardFull: React.FC = () => {
       startTime: new Date(a.startTime).toISOString().slice(0, 16),
       endTime: new Date(a.endTime).toISOString().slice(0, 16),
       isFeatured: a.isFeatured,
+      putFirst: false,
+      queueOrder: String(a.queueOrder ?? 100),
       images: a.images && a.images.length > 0 ? a.images : [STUDIO_IMAGE_PRESETS[0].url],
       newImageUrl: '',
       specsText: Array.isArray(a.specs) ? a.specs.join('\n') : '',
@@ -675,25 +880,46 @@ export const AdminDashboardFull: React.FC = () => {
     setShowAuctionModal(true);
   };
 
-  const sidebarTabs: { key: AdminTab; label: string; icon: React.ReactNode; allowed: boolean }[] = [
+  const sidebarTabs: {
+    key: AdminTab;
+    label: string;
+    icon: React.ReactNode;
+    allowed: boolean;
+    badge?: number;
+  }[] = [
     { key: 'overview', label: 'Overview & Analytics', icon: <BarChart3 className="w-4 h-4" />, allowed: true },
     {
+      key: 'alerts',
+      label: 'Admin Notifications',
+      icon: <Bell className="w-4 h-4" />,
+      allowed: true,
+      badge: unreadAlertsCount,
+    },
+    {
+      key: 'auctions',
+      label: 'Products & Queue Order',
+      icon: <Gavel className="w-4 h-4" />,
+      allowed: hasPermission('manage_auctions'),
+      badge: overview?.kpis?.pendingProducts || 0,
+    },
+    {
+      key: 'winners',
+      label: 'Winners & Tracking',
+      icon: <Trophy className="w-4 h-4" />,
+      allowed: hasPermission('manage_bids'),
+    },
+    {
       key: 'users',
-      label: 'User Management',
+      label: 'Users & Seller Approval',
       icon: <Users className="w-4 h-4" />,
       allowed: hasPermission('manage_users'),
+      badge: overview?.kpis?.pendingSellerRequests || 0,
     },
     {
       key: 'admins',
       label: 'Admin Accounts (RBAC)',
       icon: <ShieldCheck className="w-4 h-4" />,
       allowed: hasPermission('manage_admins'),
-    },
-    {
-      key: 'auctions',
-      label: 'Auction Management',
-      icon: <Gavel className="w-4 h-4" />,
-      allowed: hasPermission('manage_auctions'),
     },
     {
       key: 'categories',
@@ -716,21 +942,21 @@ export const AdminDashboardFull: React.FC = () => {
   ];
 
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-8 space-y-5 sm:space-y-6">
       {/* Header Bar */}
-      <div className="border border-slate-200 rounded-2xl p-5 bg-slate-900 text-white flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="border border-slate-200 rounded-2xl p-4 sm:p-5 bg-slate-900 text-white flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <div className="text-xs text-emerald-400 font-semibold">
             Protected Admin Console · Role: {roles.join(', ')}
           </div>
-          <h1 className="text-2xl font-bold font-display mt-0.5">
+          <h1 className="text-xl sm:text-2xl font-bold font-display mt-0.5">
             Platform Administration (@{user?.username})
           </h1>
         </div>
         <div className="flex flex-wrap items-center gap-3">
           <button
             onClick={() => setShowChangeMyPwdModal(true)}
-            className="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition"
+            className="px-3 py-2 min-h-[40px] rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition"
           >
             <KeyRound className="w-3.5 h-3.5 text-emerald-400" />
             <span>Change My Password</span>
@@ -741,31 +967,44 @@ export const AdminDashboardFull: React.FC = () => {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Sidebar */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6">
+        {/* Mobile Horizontal Tabs + Desktop Sidebar */}
         <aside className="lg:col-span-3">
-          <div className="border border-slate-200 rounded-2xl p-2 bg-white space-y-1">
+          <div className="border border-slate-200 rounded-2xl p-2 bg-white flex lg:flex-col gap-1.5 lg:gap-1 overflow-x-auto no-scrollbar">
             {sidebarTabs
               .filter((t) => t.allowed)
               .map((t) => (
                 <button
                   key={t.key}
                   onClick={() => setTab(t.key)}
-                  className={`w-full px-3 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-2.5 transition cursor-pointer ${
+                  className={`w-auto lg:w-full px-3 py-2.5 min-h-[40px] rounded-xl text-xs font-semibold flex items-center justify-between gap-2 whitespace-nowrap shrink-0 transition cursor-pointer ${
                     tab === t.key
                       ? 'bg-slate-900 text-white'
                       : 'text-slate-700 hover:bg-slate-50'
                   }`}
                 >
-                  {t.icon}
-                  <span>{t.label}</span>
+                  <span className="flex items-center gap-2">
+                    {t.icon}
+                    <span>{t.label}</span>
+                  </span>
+                  {t.badge !== undefined && t.badge > 0 && (
+                    <span
+                      className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold tabular-nums ${
+                        tab === t.key
+                          ? 'bg-emerald-500 text-white'
+                          : 'bg-amber-100 text-amber-800'
+                      }`}
+                    >
+                      {t.badge}
+                    </span>
+                  )}
                 </button>
               ))}
           </div>
         </aside>
 
         {/* Main Content */}
-        <section className="lg:col-span-9 border border-slate-200 rounded-2xl p-6 bg-white min-h-[540px]">
+        <section className="lg:col-span-9 border border-slate-200 rounded-2xl p-4 sm:p-6 bg-white min-h-[540px] min-w-0">
           {/* ================= OVERVIEW ================= */}
           {tab === 'overview' && (
             <div className="space-y-8">
@@ -792,25 +1031,11 @@ export const AdminDashboardFull: React.FC = () => {
                 ))}
               </div>
 
-              {/* Analytics Chart */}
-              {overview?.categoryStats?.length > 0 && (
-                <div className="border border-slate-200 rounded-xl p-4 space-y-3">
-                  <h3 className="text-sm font-bold text-slate-900">
-                    Auction Volume by Category (₦)
-                  </h3>
-                  <div className="h-64 w-full">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={overview.categoryStats}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                        <XAxis dataKey="category" tick={{ fontSize: 12 }} />
-                        <YAxis tick={{ fontSize: 11 }} />
-                        <Tooltip />
-                        <Bar dataKey="totalBidVolume" fill="#059669" radius={[6, 6, 0, 0]} />
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
-                </div>
-              )}
+              {/* Recharts Marketplace Data Visualizations: Bidding Velocity, Volume & Daily Participation */}
+              <AdminAnalyticsCharts
+                analytics={overview?.analytics}
+                categoryStats={overview?.categoryStats || []}
+              />
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {/* Recent Registrations */}
@@ -859,6 +1084,250 @@ export const AdminDashboardFull: React.FC = () => {
                   </div>
                 </div>
               </div>
+
+              {/* Action Queues & Recent Confirmed Winners */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="p-4 rounded-xl border border-slate-200 bg-amber-50/50 space-y-3">
+                  <h3 className="text-sm font-bold text-slate-900">Pending Admin Approvals</h3>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-700">Users requesting product posting access</span>
+                    <button
+                      onClick={() => setTab('users')}
+                      className="font-bold text-amber-800 hover:underline cursor-pointer"
+                    >
+                      {overview?.kpis?.pendingSellerRequests ?? 0} pending →
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-700">User-submitted products awaiting review</span>
+                    <button
+                      onClick={() => {
+                        setAuctionFilter('pending');
+                        setTab('auctions');
+                      }}
+                      className="font-bold text-amber-800 hover:underline cursor-pointer"
+                    >
+                      {overview?.kpis?.pendingProducts ?? 0} pending →
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-bold text-slate-900">Recent Auction Winners</h3>
+                    {hasPermission('manage_bids') && (
+                      <button
+                        onClick={() => setTab('winners')}
+                        className="text-xs font-semibold text-emerald-700 hover:underline cursor-pointer"
+                      >
+                        Track All →
+                      </button>
+                    )}
+                  </div>
+                  <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl px-4">
+                    {(overview?.recentWinners || []).length === 0 ? (
+                      <p className="py-5 text-xs text-slate-400 text-center">
+                        No completed winning bids yet.
+                      </p>
+                    ) : (
+                      overview.recentWinners.map((w: any) => (
+                        <div
+                          key={w.auctionId}
+                          className="py-2.5 flex items-center justify-between text-xs"
+                        >
+                          <div>
+                            <div className="font-semibold text-slate-900">
+                              @{w.winnerUsername} won {w.code}
+                            </div>
+                            <div className="text-slate-500 truncate max-w-[200px]">{w.title}</div>
+                          </div>
+                          <span className="font-mono font-bold text-emerald-700 tabular-nums">
+                            ₦{Number(w.winningBidAmount).toLocaleString()}
+                          </span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ================= ADMIN NOTIFICATIONS INBOX ================= */}
+          {tab === 'alerts' && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900">
+                    Administrator Alerts & Winner Notifications
+                  </h2>
+                  <p className="text-xs text-slate-500">
+                    Real-time alerts when auctions close with winners, users request seller access, or new products need approval.
+                  </p>
+                </div>
+                <button
+                  onClick={async () => {
+                    await apiRequest('/api/admin/notifications/read', {
+                      method: 'PATCH',
+                      body: JSON.stringify({}),
+                    });
+                    await loadAdminAlerts();
+                  }}
+                  className="text-xs font-semibold text-emerald-700 hover:underline cursor-pointer"
+                >
+                  Mark all as read
+                </button>
+              </div>
+
+              {adminAlerts.length === 0 ? (
+                <p className="py-12 text-center text-xs text-slate-500 border border-slate-200 rounded-xl">
+                  No administrator alerts yet.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {adminAlerts.map((n) => (
+                    <div
+                      key={n.id}
+                      onClick={async () => {
+                        if (!n.isRead) {
+                          await apiRequest('/api/admin/notifications/read', {
+                            method: 'PATCH',
+                            body: JSON.stringify({ id: n.id }),
+                          });
+                          await loadAdminAlerts();
+                        }
+                      }}
+                      className={`p-3.5 rounded-xl border text-xs cursor-pointer transition ${
+                        n.isRead
+                          ? 'border-slate-200 bg-white text-slate-600'
+                          : 'border-emerald-300 bg-emerald-50/60 text-slate-900'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between font-semibold">
+                        <span>{n.title}</span>
+                        <span className="text-[11px] text-slate-400">
+                          {new Date(n.createdAt).toLocaleString()}
+                        </span>
+                      </div>
+                      <p className="mt-1">{n.message}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ================= WINNER TRACKING & SETTLEMENTS ================= */}
+          {tab === 'winners' && (
+            <div className="space-y-5">
+              <div>
+                <h2 className="text-lg font-bold text-slate-900">
+                  Bid Winner Tracking & Notifications
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Track highest bidders on live lots and confirmed winners on closed auctions, send winner & admin notifications, and update escrow/delivery status.
+                </p>
+              </div>
+
+              {winnersList.length === 0 ? (
+                <p className="py-12 text-center text-xs text-slate-500 border border-slate-200 rounded-xl">
+                  No bids or completed auction winners recorded yet.
+                </p>
+              ) : (
+                <div className="overflow-x-auto border border-slate-200 rounded-xl">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                      <tr>
+                        <th className="py-2.5 px-3 font-semibold">Product Lot</th>
+                        <th className="py-2.5 px-3 font-semibold">Leading / Winning Bidder</th>
+                        <th className="py-2.5 px-3 font-semibold text-right">Winning Bid</th>
+                        <th className="py-2.5 px-3 font-semibold">Settlement Tracking</th>
+                        <th className="py-2.5 px-3 font-semibold text-right">Notify</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {winnersList.map((w) => (
+                        <tr key={w.auctionId} className="hover:bg-slate-50">
+                          <td className="py-3 px-3">
+                            <div className="flex items-center gap-2.5">
+                              {w.imageUrl && (
+                                <img
+                                  src={w.imageUrl}
+                                  alt={w.title}
+                                  className="w-11 h-9 rounded object-cover border border-slate-200 shrink-0"
+                                />
+                              )}
+                              <div>
+                                <div className="font-semibold text-slate-900">{w.title}</div>
+                                <div className="text-slate-500">
+                                  {w.code} ·{' '}
+                                  <span
+                                    className={
+                                      w.status === 'ended'
+                                        ? 'text-emerald-700 font-semibold'
+                                        : 'text-amber-700 font-semibold'
+                                    }
+                                  >
+                                    {w.status === 'ended' ? 'Final Winner' : `Currently Leading (${w.status})`}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="py-3 px-3">
+                            {w.winnerUsername ? (
+                              <div>
+                                <div className="font-semibold text-slate-900">
+                                  @{w.winnerUsername}
+                                  {w.winnerDetails?.fullName ? ` · ${w.winnerDetails.fullName}` : ''}
+                                </div>
+                                <div className="text-slate-500">
+                                  {w.winnerDetails?.email || ''}
+                                  {w.winnerDetails?.phone ? ` · ${w.winnerDetails.phone}` : ''}
+                                </div>
+                              </div>
+                            ) : (
+                              <span className="text-slate-400">Closed with 0 bids</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-right font-mono font-bold text-emerald-700 tabular-nums">
+                            ₦{Number(w.winningBidAmount || 0).toLocaleString()}
+                          </td>
+                          <td className="py-3 px-3">
+                            {w.winnerId ? (
+                              <select
+                                value={w.winnerStatus}
+                                onChange={(e) =>
+                                  handleUpdateWinnerStatus(w.auctionId, e.target.value)
+                                }
+                                className="px-2 py-1 border border-slate-300 rounded-lg bg-white font-semibold"
+                              >
+                                <option value="pending">Pending Contact</option>
+                                <option value="notified">Winner Notified</option>
+                                <option value="escrow_paid">Escrow Paid</option>
+                                <option value="dispatched">Dispatched</option>
+                                <option value="settled">Completed & Settled</option>
+                              </select>
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-right whitespace-nowrap">
+                            {w.winnerId && (
+                              <button
+                                onClick={() => handleNotifyWinnerAndAdmins(w.auctionId)}
+                                className="px-2.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-lg font-semibold cursor-pointer"
+                              >
+                                Notify Winner & Admin
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           )}
 
@@ -902,7 +1371,7 @@ export const AdminDashboardFull: React.FC = () => {
                       <th className="py-2.5 px-3 font-semibold">User</th>
                       <th className="py-2.5 px-3 font-semibold">Contact</th>
                       <th className="py-2.5 px-3 font-semibold">Role & Status</th>
-                      <th className="py-2.5 px-3 font-semibold">Registered</th>
+                      <th className="py-2.5 px-3 font-semibold">Product Posting</th>
                       <th className="py-2.5 px-3 font-semibold text-right">Actions</th>
                     </tr>
                   </thead>
@@ -931,10 +1400,32 @@ export const AdminDashboardFull: React.FC = () => {
                             {u.status}
                           </div>
                         </td>
-                        <td className="py-2.5 px-3 tabular-nums text-slate-500">
-                          {new Date(u.createdAt).toLocaleDateString()}
+                        <td className="py-2.5 px-3">
+                          {u.canPostProducts ? (
+                            <span className="inline-block px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 font-semibold">
+                              Approved Seller
+                            </span>
+                          ) : u.sellerApprovalRequested ? (
+                            <span className="inline-block px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 font-semibold">
+                              Requested Approval
+                            </span>
+                          ) : (
+                            <span className="text-slate-400">Bidder Only</span>
+                          )}
                         </td>
                         <td className="py-2.5 px-3 text-right space-x-1 whitespace-nowrap">
+                          {!u.isAdmin && (
+                            <button
+                              onClick={() => handleToggleUserPostingPermission(u)}
+                              className={`px-2 py-1 rounded font-semibold cursor-pointer border ${
+                                u.canPostProducts
+                                  ? 'border-slate-300 text-slate-700 hover:bg-slate-100'
+                                  : 'border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700'
+                              }`}
+                            >
+                              {u.canPostProducts ? 'Revoke Posting' : 'Approve to Post'}
+                            </button>
+                          )}
                           <button
                             onClick={() => handleViewUserHistory(u)}
                             title="View Auction History"
@@ -1072,89 +1563,245 @@ export const AdminDashboardFull: React.FC = () => {
             </div>
           )}
 
-          {/* ================= AUCTION MANAGEMENT ================= */}
+          {/* ================= AUCTION MANAGEMENT, APPROVALS & QUEUE ORDERING ================= */}
           {tab === 'auctions' && (
             <div className="space-y-5">
-              <div className="flex items-center justify-between">
-                <h2 className="text-lg font-bold text-slate-900">Auction Management</h2>
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900">
+                    Products, Approvals & Display Order
+                  </h2>
+                  <p className="text-xs text-slate-500">
+                    Upload new auction products, review user-submitted items, and arrange which product appears first (#1) on the homepage & auction queue.
+                  </p>
+                </div>
                 <button
                   onClick={() => {
                     setEditingAuctionId(null);
+                    setAuctionForm({
+                      title: '',
+                      description: '',
+                      categoryId: categoriesList[0]?.id ? String(categoriesList[0].id) : '',
+                      categoryName: categoriesList[0]?.name || 'Phones',
+                      condition: 'Brand New',
+                      brand: '',
+                      location: 'Ikeja, Lagos',
+                      sellerName: 'NaijaAuction Verified',
+                      startingPrice: '500000',
+                      bidIncrement: '10000',
+                      reservePrice: '',
+                      estimatedMarketValue: '750000',
+                      status: 'live',
+                      startTime: new Date().toISOString().slice(0, 16),
+                      endTime: new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 16),
+                      isFeatured: true,
+                      putFirst: false,
+                      queueOrder: String(auctionsList.length + 1),
+                      images: [STUDIO_IMAGE_PRESETS[0].url],
+                      newImageUrl: '',
+                      specsText: '',
+                    });
                     setShowAuctionModal(true);
                   }}
-                  className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                  className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer shrink-0"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>Create Auction Listing</span>
+                  <span>Upload Product for Auction</span>
                 </button>
+              </div>
+
+              {/* Filter Tabs */}
+              <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                {[
+                  { key: 'all', label: `All (${auctionsList.length})` },
+                  {
+                    key: 'pending',
+                    label: `Pending Approval (${
+                      auctionsList.filter((a) => a.approvalStatus === 'pending').length
+                    })`,
+                  },
+                  { key: 'live', label: 'Live Now' },
+                  { key: 'scheduled', label: 'Scheduled' },
+                  { key: 'ended', label: 'Ended' },
+                ].map((f) => (
+                  <button
+                    key={f.key}
+                    onClick={() => setAuctionFilter(f.key as any)}
+                    className={`px-3 py-1.5 rounded-lg font-semibold cursor-pointer border transition ${
+                      auctionFilter === f.key
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+                {reorderingSaving && (
+                  <span className="text-emerald-700 font-semibold ml-2">Saving order...</span>
+                )}
               </div>
 
               <div className="overflow-x-auto border border-slate-200 rounded-xl">
                 <table className="w-full text-left text-xs">
                   <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
                     <tr>
-                      <th className="py-2.5 px-3 font-semibold">Lot</th>
-                      <th className="py-2.5 px-3 font-semibold">Status</th>
+                      <th className="py-2.5 px-3 font-semibold">Order</th>
+                      <th className="py-2.5 px-3 font-semibold">Lot & Seller</th>
+                      <th className="py-2.5 px-3 font-semibold">Approval / Status</th>
                       <th className="py-2.5 px-3 font-semibold text-right">Current Bid</th>
                       <th className="py-2.5 px-3 font-semibold text-right">Bids</th>
                       <th className="py-2.5 px-3 font-semibold text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {auctionsList.map((a) => (
-                      <tr key={a.id} className="hover:bg-slate-50">
-                        <td className="py-3 px-3">
-                          <div className="font-semibold text-slate-900">{a.title}</div>
-                          <div className="text-slate-500">
-                            {a.code} · {a.categoryName} · Closes{' '}
-                            {new Date(a.effectiveEndTime).toLocaleString()}
-                          </div>
-                        </td>
-                        <td className="py-3 px-3 font-semibold text-slate-800">{a.status}</td>
-                        <td className="py-3 px-3 text-right font-mono font-semibold tabular-nums">
-                          ₦{Number(a.currentBid).toLocaleString()}
-                        </td>
-                        <td className="py-3 px-3 text-right tabular-nums">{a.bidsCount}</td>
-                        <td className="py-3 px-3 text-right space-x-1 whitespace-nowrap">
-                          <button
-                            onClick={() => handleInspectBids(a)}
-                            className="px-2 py-1 border border-slate-300 rounded hover:bg-slate-100 font-semibold cursor-pointer"
-                          >
-                            Bids
-                          </button>
-                          <button
-                            onClick={() => openEditAuctionModal(a)}
-                            className="px-2 py-1 border border-slate-300 rounded hover:bg-slate-100 font-semibold cursor-pointer"
-                          >
-                            Edit
-                          </button>
-                          {a.status !== 'live' && a.status !== 'ended' && (
+                    {auctionsList
+                      .filter((a) => {
+                        if (auctionFilter === 'all') return true;
+                        if (auctionFilter === 'pending') return a.approvalStatus === 'pending';
+                        return a.status === auctionFilter;
+                      })
+                      .map((a) => {
+                        const globalIndex = auctionsList.findIndex((x) => x.id === a.id);
+                        return (
+                        <tr key={a.id} className="hover:bg-slate-50">
+                          <td className="py-3 px-3 whitespace-nowrap">
+                            <div className="flex items-center gap-1">
+                              <span className="font-mono font-bold text-slate-900 w-7">
+                                #{globalIndex + 1}
+                              </span>
+                              <button
+                                onClick={() => handleReorderAuction(a.id, 'first')}
+                                disabled={globalIndex === 0}
+                                title="Put First (#1)"
+                                className="p-1 border border-slate-200 rounded hover:bg-emerald-50 hover:text-emerald-700 cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
+                              >
+                                <ArrowUpToLine className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => handleReorderAuction(a.id, 'up')}
+                                disabled={globalIndex <= 0}
+                                title="Move Up"
+                                className="p-1 border border-slate-200 rounded hover:bg-slate-100 cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
+                              >
+                                <ArrowUp className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => handleReorderAuction(a.id, 'down')}
+                                disabled={globalIndex === auctionsList.length - 1}
+                                title="Move Down"
+                                className="p-1 border border-slate-200 rounded hover:bg-slate-100 cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
+                              >
+                                <ArrowDown className="w-3 h-3" />
+                              </button>
+                            </div>
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="flex items-center gap-2.5">
+                              {a.images?.[0] && (
+                                <img
+                                  src={a.images[0]}
+                                  alt={a.title}
+                                  className="w-11 h-9 rounded object-cover border border-slate-200 shrink-0"
+                                />
+                              )}
+                              <div>
+                                <div className="font-semibold text-slate-900">{a.title}</div>
+                                <div className="text-slate-500">
+                                  {a.code} · {a.categoryName} ·{' '}
+                                  {a.sellerUsername ? `Posted by @${a.sellerUsername}` : a.sellerName}
+                                </div>
+                                <div className="text-[11px] text-slate-400 tabular-nums mt-0.5">
+                                  Slot: {new Date(a.startTime).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })} –{' '}
+                                  {new Date(a.endTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="font-semibold text-slate-800">{a.status}</div>
+                            {a.approvalStatus === 'pending' && (
+                              <span className="inline-block mt-0.5 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-semibold text-[10px]">
+                                Pending Approval
+                              </span>
+                            )}
+                            {a.approvalStatus === 'rejected' && (
+                              <span className="inline-block mt-0.5 px-1.5 py-0.5 rounded bg-rose-100 text-rose-800 font-semibold text-[10px]">
+                                Rejected
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-right font-mono font-semibold tabular-nums">
+                            ₦{Number(a.currentBid).toLocaleString()}
+                          </td>
+                          <td className="py-3 px-3 text-right tabular-nums">{a.bidsCount}</td>
+                          <td className="py-3 px-3 text-right space-x-1 whitespace-nowrap">
+                            {a.approvalStatus === 'pending' && (
+                              <>
+                                <button
+                                  onClick={() => handleApproveProduct(a.id, 'live')}
+                                  className="px-2 py-1 bg-emerald-600 text-white rounded font-semibold cursor-pointer"
+                                >
+                                  Approve & Live
+                                </button>
+                                <button
+                                  onClick={() => handleApproveProduct(a.id, 'scheduled')}
+                                  className="px-2 py-1 border border-emerald-600 text-emerald-700 rounded font-semibold cursor-pointer"
+                                >
+                                  Approve Scheduled
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    setRejectProductTarget(a);
+                                    setRejectReasonInput('');
+                                  }}
+                                  className="px-2 py-1 border border-rose-300 text-rose-700 rounded font-semibold cursor-pointer"
+                                >
+                                  Reject
+                                </button>
+                              </>
+                            )}
                             <button
-                              onClick={() => handleAuctionAction(a.id, 'live')}
-                              className="px-2 py-1 bg-emerald-600 text-white rounded font-semibold cursor-pointer"
+                              onClick={() => handleInspectBids(a)}
+                              className="px-2 py-1 border border-slate-300 rounded hover:bg-slate-100 font-semibold cursor-pointer"
                             >
-                              Start
+                              Bids
                             </button>
-                          )}
-                          {a.status === 'live' && (
                             <button
-                              onClick={() => handleAuctionAction(a.id, 'ended')}
-                              className="px-2 py-1 bg-slate-900 text-white rounded font-semibold cursor-pointer"
+                              onClick={() => openEditAuctionModal(a)}
+                              className="px-2 py-1 border border-slate-300 rounded hover:bg-slate-100 font-semibold cursor-pointer"
                             >
-                              Close
+                              Edit
                             </button>
-                          )}
-                          {a.status !== 'cancelled' && a.status !== 'ended' && (
-                            <button
-                              onClick={() => handleAuctionAction(a.id, 'cancelled')}
-                              className="px-2 py-1 border border-rose-300 text-rose-700 rounded font-semibold cursor-pointer"
-                            >
-                              Cancel
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
+                            {a.approvalStatus === 'approved' &&
+                              a.status !== 'live' &&
+                              a.status !== 'ended' && (
+                                <button
+                                  onClick={() => handleAuctionAction(a.id, 'live')}
+                                  className="px-2 py-1 bg-emerald-600 text-white rounded font-semibold cursor-pointer"
+                                >
+                                  Start
+                                </button>
+                              )}
+                            {a.status === 'live' && (
+                              <button
+                                onClick={() => handleAuctionAction(a.id, 'ended')}
+                                className="px-2 py-1 bg-slate-900 text-white rounded font-semibold cursor-pointer"
+                              >
+                                Close
+                              </button>
+                            )}
+                            {a.status !== 'cancelled' && a.status !== 'ended' && (
+                              <button
+                                onClick={() => handleAuctionAction(a.id, 'cancelled')}
+                                className="px-2 py-1 border border-rose-300 text-rose-700 rounded font-semibold cursor-pointer"
+                              >
+                                Cancel
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                        );
+                      })}
                   </tbody>
                 </table>
               </div>
@@ -1369,6 +2016,8 @@ export const AdminDashboardFull: React.FC = () => {
                   </label>
                   <input
                     type="number"
+                    min={10}
+                    max={300}
                     value={settingsForm.antiSnipingSeconds}
                     onChange={(e) =>
                       setSettingsForm({
@@ -1378,6 +2027,87 @@ export const AdminDashboardFull: React.FC = () => {
                     }
                     className="w-full px-3 py-2 border border-slate-300 rounded-lg"
                   />
+                </div>
+
+                {/* Live Auction Slot & Gap Timing Controls */}
+                <div className="p-4 rounded-xl border border-emerald-200 bg-emerald-50/50 space-y-2">
+                  <label className="block font-bold text-slate-900">
+                    Time Between Auctions (Minutes)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1440}
+                    value={settingsForm.timeBetweenAuctionsMinutes ?? 15}
+                    onChange={(e) =>
+                      setSettingsForm({
+                        ...settingsForm,
+                        timeBetweenAuctionsMinutes: Number(e.target.value),
+                      })
+                    }
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg bg-white"
+                  />
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {[0, 5, 15, 30, 60].map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() =>
+                          setSettingsForm({ ...settingsForm, timeBetweenAuctionsMinutes: m })
+                        }
+                        className={`px-2 py-0.5 rounded border text-[11px] font-semibold cursor-pointer ${
+                          (settingsForm.timeBetweenAuctionsMinutes ?? 15) === m
+                            ? 'bg-emerald-600 text-white border-emerald-600'
+                            : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                        }`}
+                      >
+                        {m === 0 ? 'No Gap' : `${m}m gap`}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-slate-600">
+                    Real-time cooldown interval enforced between sequential live auction slots.
+                  </p>
+                </div>
+
+                <div className="p-4 rounded-xl border border-slate-200 bg-slate-50 space-y-2">
+                  <label className="block font-bold text-slate-900">
+                    Default Live Auction Slot Duration (Minutes)
+                  </label>
+                  <input
+                    type="number"
+                    min={5}
+                    max={1440}
+                    value={settingsForm.defaultSlotDurationMinutes ?? 60}
+                    onChange={(e) =>
+                      setSettingsForm({
+                        ...settingsForm,
+                        defaultSlotDurationMinutes: Number(e.target.value),
+                      })
+                    }
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg bg-white"
+                  />
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {[15, 30, 60, 120].map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() =>
+                          setSettingsForm({ ...settingsForm, defaultSlotDurationMinutes: m })
+                        }
+                        className={`px-2 py-0.5 rounded border text-[11px] font-semibold cursor-pointer ${
+                          (settingsForm.defaultSlotDurationMinutes ?? 60) === m
+                            ? 'bg-slate-900 text-white border-slate-900'
+                            : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                        }`}
+                      >
+                        {m}m slot
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-slate-600">
+                    Length of each live auction slot offered to sellers when posting products.
+                  </p>
                 </div>
 
                 <div className="sm:col-span-2 flex flex-wrap gap-6 py-2">
@@ -1578,6 +2308,16 @@ export const AdminDashboardFull: React.FC = () => {
               <option value="suspended">Suspended</option>
               <option value="banned">Banned</option>
             </select>
+            <label className="flex items-center gap-2 font-semibold text-slate-800 pt-1 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={Boolean(editUserTarget.canPostProducts)}
+                onChange={(e) =>
+                  setEditUserTarget({ ...editUserTarget, canPostProducts: e.target.checked })
+                }
+              />
+              <span>Approve User to Post Products for Bidding</span>
+            </label>
             <button
               type="submit"
               className="w-full py-2.5 bg-emerald-600 text-white font-semibold rounded-lg cursor-pointer"
@@ -1969,6 +2709,40 @@ export const AdminDashboardFull: React.FC = () => {
                   className="w-full px-3 py-2 border border-slate-300 rounded-lg"
                 />
               </div>
+              <div className="sm:col-span-2 flex items-center justify-between pt-1">
+                <span className="font-semibold text-slate-700">Live Auction Time Window</span>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const res = await apiRequest<{ slots: any[] }>('/api/public/auction-slots?dayOffset=0');
+                      const nextOpen = (res.slots || []).find((s) => s.state === 'available');
+                      if (nextOpen) {
+                        const toLocal = (iso: string) => {
+                          const d = new Date(iso);
+                          return new Date(d.getTime() - d.getTimezoneOffset() * 60000)
+                            .toISOString()
+                            .slice(0, 16);
+                        };
+                        setAuctionForm((prev) => ({
+                          ...prev,
+                          status: 'scheduled',
+                          startTime: toLocal(nextOpen.startTime),
+                          endTime: toLocal(nextOpen.endTime),
+                        }));
+                        showToast('success', 'Slot Selected', 'Snapped to next open live auction slot.');
+                      } else {
+                        showToast('info', 'No Slots Today', 'No open slots left today; adjust times manually.');
+                      }
+                    } catch {
+                      showToast('error', 'Error', 'Unable to load available slots.');
+                    }
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-800 border border-emerald-200 font-semibold hover:bg-emerald-100 cursor-pointer"
+                >
+                  Snap to Next Open Live Slot
+                </button>
+              </div>
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Start Time</label>
                 <input
@@ -1989,11 +2763,48 @@ export const AdminDashboardFull: React.FC = () => {
                   className="w-full px-3 py-2 border border-slate-300 rounded-lg"
                 />
               </div>
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">
+                  Display Order Priority (#1 Comes First)
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  value={auctionForm.queueOrder}
+                  onChange={(e) => setAuctionForm({ ...auctionForm, queueOrder: e.target.value })}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg"
+                />
+              </div>
+              <div className="flex items-end pb-2">
+                {!editingAuctionId && (
+                  <label className="flex items-center gap-2 font-semibold text-slate-800 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={auctionForm.putFirst}
+                      onChange={(e) =>
+                        setAuctionForm({ ...auctionForm, putFirst: e.target.checked })
+                      }
+                    />
+                    <span>Place This Product First (#1 in Catalog)</span>
+                  </label>
+                )}
+              </div>
               <div className="sm:col-span-2 space-y-2">
                 <label className="block font-semibold text-slate-700">
-                  Product Images (Multiple Supported)
+                  Upload Product Photos (Device Upload, Studio Presets, or URL)
                 </label>
-                <div className="flex flex-wrap gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <label className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg inline-flex items-center gap-1.5 cursor-pointer">
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>Upload Photos from Device</span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={handleAdminUploadImages}
+                      className="hidden"
+                    />
+                  </label>
                   {STUDIO_IMAGE_PRESETS.map((p) => (
                     <button
                       key={p.url}
@@ -2041,9 +2852,24 @@ export const AdminDashboardFull: React.FC = () => {
                   {auctionForm.images.map((url, idx) => (
                     <div
                       key={idx}
-                      className="relative w-16 h-12 rounded border border-slate-200 overflow-hidden"
+                      className="relative w-20 h-14 rounded border border-slate-200 overflow-hidden"
                     >
                       <img src={url} alt="" className="w-full h-full object-cover" />
+                      {idx > 0 && (
+                        <button
+                          type="button"
+                          title="Set as primary photo"
+                          onClick={() => {
+                            const next = [...auctionForm.images];
+                            const [picked] = next.splice(idx, 1);
+                            next.unshift(picked);
+                            setAuctionForm({ ...auctionForm, images: next });
+                          }}
+                          className="absolute bottom-0 left-0 bg-slate-900/80 text-white px-1 text-[9px] cursor-pointer"
+                        >
+                          Cover
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() =>
@@ -2075,6 +2901,51 @@ export const AdminDashboardFull: React.FC = () => {
                 className="px-5 py-2 bg-emerald-600 text-white rounded-lg font-semibold cursor-pointer"
               >
                 {editingAuctionId ? 'Save Changes' : 'Publish Auction'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Reject Submitted Product Modal */}
+      {rejectProductTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
+          <form
+            onSubmit={handleConfirmRejectProduct}
+            className="bg-white rounded-2xl max-w-md w-full p-6 space-y-3 text-xs border border-slate-200"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-bold text-slate-900">
+                Reject Product: {rejectProductTarget.code}
+              </h3>
+              <button type="button" onClick={() => setRejectProductTarget(null)}>
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-slate-600">
+              Provide a reason why "{rejectProductTarget.title}" cannot be listed. The seller will be notified.
+            </p>
+            <textarea
+              rows={3}
+              required
+              value={rejectReasonInput}
+              onChange={(e) => setRejectReasonInput(e.target.value)}
+              placeholder="e.g. Photos are blurry or starting price needs verification..."
+              className="w-full px-3 py-2 border border-slate-300 rounded-lg"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setRejectProductTarget(null)}
+                className="px-4 py-2 border border-slate-300 rounded-lg font-semibold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 bg-rose-600 text-white rounded-lg font-semibold cursor-pointer"
+              >
+                Confirm Reject
               </button>
             </div>
           </form>

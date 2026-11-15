@@ -1,6 +1,7 @@
 import { Router } from 'express';
-import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
-import { Server as SocketIOServer } from 'socket.io';
+import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
+import crypto from 'crypto';
+import type { Server as SocketIOServer } from 'socket.io';
 import { db } from '../../db/index.ts';
 import { ensureSeeded } from '../../db/seed.ts';
 import {
@@ -15,9 +16,16 @@ import {
   watchlists,
   websiteSettings,
 } from '../../db/schema.ts';
-import { AuthRequest, getClientIp, requireAuth } from '../authMiddleware.ts';
-import { isValidPhone, sanitizeText } from '../security.ts';
+import { type AuthRequest, getClientIp, requireAuth } from '../authMiddleware.ts';
+import { isValidPhone, sanitizeRichText, sanitizeText } from '../security.ts';
 import { reconcileAuctionLifecycles } from '../auctionWorker.ts';
+import {
+  clearSlotHold,
+  computeAuctionSlots,
+  findSlotConflict,
+  getAuctionTimingConfig,
+} from '../slotManager.ts';
+import { computeBidderTrustScores } from '../trustScore.ts';
 
 export function createAuctionsRouter(io: SocketIOServer) {
   const router = Router();
@@ -52,6 +60,40 @@ export function createAuctionsRouter(io: SocketIOServer) {
     }
   });
 
+  // Real-Time Live Auction Slot Schedule (respecting admin timeBetweenAuctionsMinutes)
+  router.get('/public/auction-slots', async (req: AuthRequest, res) => {
+    try {
+      await ensureSeeded();
+      await reconcileAuctionLifecycles(io);
+      const dayOffset = Number(req.query.dayOffset || 0);
+      const data = await computeAuctionSlots({
+        dayOffset: Number.isFinite(dayOffset) ? dayOffset : 0,
+        currentUserId: req.auth?.user.id ?? null,
+      });
+      res.json(data);
+    } catch (err) {
+      console.error('GET /public/auction-slots error:', err);
+      res.status(500).json({ error: 'Failed to load live auction slots.' });
+    }
+  });
+
+  // Public Bidder Trust Scores lookup
+  router.get('/public/trust-scores', async (req, res) => {
+    try {
+      await ensureSeeded();
+      const raw = typeof req.query.usernames === 'string' ? req.query.usernames : '';
+      const names = raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const trustScores = await computeBidderTrustScores(names);
+      res.json({ trustScores });
+    } catch (err) {
+      console.error('GET /public/trust-scores error:', err);
+      res.status(500).json({ error: 'Failed to compute bidder trust scores.' });
+    }
+  });
+
   // Public Auctions Listing (Live, Upcoming/Scheduled, Completed/Ended)
   router.get('/public/auctions', async (req: AuthRequest, res) => {
     try {
@@ -64,8 +106,13 @@ export function createAuctionsRouter(io: SocketIOServer) {
       const allAuctions = await db
         .select()
         .from(auctions)
-        .where(ne(auctions.status, 'draft'))
-        .orderBy(desc(auctions.isFeatured), auctions.effectiveEndTime);
+        .where(and(ne(auctions.status, 'draft'), eq(auctions.approvalStatus, 'approved')))
+        .orderBy(
+          asc(auctions.queueOrder),
+          desc(auctions.isFeatured),
+          asc(auctions.effectiveEndTime),
+          asc(auctions.id)
+        );
 
       const auctionIds = allAuctions.map((a) => a.id);
       const imageRows =
@@ -130,6 +177,7 @@ export function createAuctionsRouter(io: SocketIOServer) {
           winningBidAmount: a.winningBidAmount,
           bidsCount: a.bidsCount,
           isFeatured: a.isFeatured,
+          queueOrder: a.queueOrder,
           specs: a.specs,
           images: imagesByAuction.get(a.id) || [],
           isWatchlisted: userWatchlistSet.has(a.id),
@@ -157,7 +205,13 @@ export function createAuctionsRouter(io: SocketIOServer) {
         .where(eq(auctions.id, auctionId))
         .limit(1);
 
-      if (!auction || auction.status === 'draft') {
+      const isOwnerOrAdmin =
+        req.auth?.user.isAdmin || (auction && auction.sellerId === req.auth?.user.id);
+      if (
+        !auction ||
+        auction.status === 'draft' ||
+        (auction.approvalStatus !== 'approved' && !isOwnerOrAdmin)
+      ) {
         return res.status(404).json({ error: 'Auction not found.' });
       }
 
@@ -207,6 +261,12 @@ export function createAuctionsRouter(io: SocketIOServer) {
         isWatchlisted = wl.length > 0;
       }
 
+      const participantNames = new Set<string>();
+      for (const b of bidRows) participantNames.add(b.username);
+      for (const d of discussionRows) participantNames.add(d.username);
+      if (auction.winnerUsername) participantNames.add(auction.winnerUsername);
+      const trustScores = await computeBidderTrustScores(Array.from(participantNames));
+
       res.json({
         auction: {
           ...auction,
@@ -214,8 +274,15 @@ export function createAuctionsRouter(io: SocketIOServer) {
           images: imgs.map((i) => i.imageUrl),
           isWatchlisted,
         },
-        bids: bidRows,
-        discussions: discussionRows.reverse(),
+        bids: bidRows.map((b) => ({
+          ...b,
+          trustProfile: trustScores[b.username.toLowerCase()] || null,
+        })),
+        discussions: discussionRows.reverse().map((d) => ({
+          ...d,
+          trustProfile: trustScores[d.username.toLowerCase()] || null,
+        })),
+        trustScores,
       });
     } catch (err) {
       console.error('GET /public/auctions/:id error:', err);
@@ -350,6 +417,9 @@ export function createAuctionsRouter(io: SocketIOServer) {
         };
       });
 
+      const bidderTrustMap = await computeBidderTrustScores([user.username]);
+      const bidderTrust = bidderTrustMap[user.username.toLowerCase()] || null;
+
       io.emit('auction:bid_placed', {
         auctionId,
         currentBid: result.auction.currentBid,
@@ -363,6 +433,7 @@ export function createAuctionsRouter(io: SocketIOServer) {
           username: result.bid.username,
           amount: result.bid.amount,
           createdAt: result.bid.createdAt,
+          trustProfile: bidderTrust,
         },
       });
 
@@ -382,7 +453,7 @@ export function createAuctionsRouter(io: SocketIOServer) {
           ? `Bid of ₦${amount.toLocaleString()} accepted! Anti-sniping extended timer by ${antiSnipingSec}s.`
           : `Bid of ₦${amount.toLocaleString()} accepted! You are currently leading.`,
         auction: result.auction,
-        bid: result.bid,
+        bid: { ...result.bid, trustProfile: bidderTrust },
       });
     } catch (err: any) {
       if (err?.status && err?.message) {
@@ -443,6 +514,9 @@ export function createAuctionsRouter(io: SocketIOServer) {
         })
         .returning();
 
+      const trustMap = await computeBidderTrustScores([inserted.username]);
+      const trustProfile = trustMap[inserted.username.toLowerCase()] || null;
+
       io.emit('auction:discussion', {
         auctionId,
         discussion: {
@@ -450,10 +524,11 @@ export function createAuctionsRouter(io: SocketIOServer) {
           username: inserted.username,
           message: inserted.message,
           createdAt: inserted.createdAt,
+          trustProfile,
         },
       });
 
-      res.status(201).json({ discussion: inserted });
+      res.status(201).json({ discussion: { ...inserted, trustProfile } });
     } catch (err) {
       console.error('POST /auctions/:id/discussions error:', err);
       res.status(500).json({ error: 'Failed to send message.' });
@@ -560,6 +635,29 @@ export function createAuctionsRouter(io: SocketIOServer) {
           )
         );
 
+      // User-submitted products
+      const myProducts = await db
+        .select()
+        .from(auctions)
+        .where(eq(auctions.sellerId, userId))
+        .orderBy(desc(auctions.createdAt));
+
+      const myProdIds = myProducts.map((p) => p.id);
+      const myProdImgs =
+        myProdIds.length > 0
+          ? await db
+              .select()
+              .from(auctionImages)
+              .where(inArray(auctionImages.auctionId, myProdIds))
+              .orderBy(auctionImages.sortOrder)
+          : [];
+      const myProdImgMap = new Map<number, string[]>();
+      for (const img of myProdImgs) {
+        const list = myProdImgMap.get(img.auctionId) || [];
+        list.push(img.imageUrl);
+        myProdImgMap.set(img.auctionId, list);
+      }
+
       res.json({
         stats: {
           activeBidsCount: activeBids.length,
@@ -568,6 +666,7 @@ export function createAuctionsRouter(io: SocketIOServer) {
           totalBidsPlaced: userBids.length,
           watchlistCount: watchlistRows.length,
           activeSessionsCount: activeSessions.length,
+          submittedProductsCount: myProducts.length,
         },
         activeBids,
         winningBids,
@@ -578,10 +677,284 @@ export function createAuctionsRouter(io: SocketIOServer) {
         })),
         bidHistory: userBids,
         notifications: notifRows,
+        myProducts: myProducts.map((p) => ({
+          ...p,
+          images: myProdImgMap.get(p.id) || [],
+        })),
       });
     } catch (err) {
       console.error('GET /user/dashboard error:', err);
       res.status(500).json({ error: 'Failed to load dashboard data.' });
+    }
+  });
+
+  // Request Seller / Product Posting Approval
+  router.post('/user/request-seller-access', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = req.auth!.user;
+      if (user.canPostProducts || user.isAdmin) {
+        return res.json({
+          success: true,
+          message: 'Your account is already approved to post products for bidding.',
+        });
+      }
+
+      await db
+        .update(users)
+        .set({ sellerApprovalRequested: true, updatedAt: new Date() })
+        .where(eq(users.id, user.id));
+
+      const activeAdmins = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(and(eq(users.isAdmin, true), eq(users.status, 'active')));
+
+      for (const adm of activeAdmins) {
+        const msg = `@${user.username} (${user.fullName}) requested permission to post products for auction bidding.`;
+        await db.insert(notifications).values({
+          userId: adm.id,
+          type: 'admin_seller_request',
+          title: 'Seller Posting Approval Request',
+          message: msg,
+        });
+        io.emit('notification:user', {
+          userId: adm.id,
+          type: 'admin_seller_request',
+          title: 'Seller Posting Approval Request',
+          message: msg,
+        });
+      }
+
+      io.emit('notification:admin', {
+        type: 'admin_seller_request',
+        title: 'Seller Approval Requested',
+        message: `@${user.username} requested permission to post products.`,
+      });
+
+      res.json({
+        success: true,
+        message: 'Your request to post products has been sent to the administrator for approval.',
+      });
+    } catch (err) {
+      console.error('POST /user/request-seller-access error:', err);
+      res.status(500).json({ error: 'Failed to submit seller approval request.' });
+    }
+  });
+
+  // Approved User Posts a Product for Bidding into a Selected Live Auction Slot
+  router.post('/user/products', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = req.auth!.user;
+      if (!user.canPostProducts && !user.isAdmin) {
+        return res.status(403).json({
+          error:
+            'Your account is not yet approved to post products. Request seller approval or contact an administrator.',
+        });
+      }
+
+      const title = sanitizeText(req.body.title, 160);
+      const description = sanitizeRichText(req.body.description || title, 4000);
+      const categoryId = req.body.categoryId ? Number(req.body.categoryId) : null;
+      const condition = sanitizeText(req.body.condition || 'Brand New', 40);
+      const brand = sanitizeText(req.body.brand || 'Verified', 60);
+      const location = sanitizeText(req.body.location || 'Lagos, Nigeria', 80);
+      const startingPrice = Number(req.body.startingPrice);
+      const bidIncrement = Number(req.body.bidIncrement || 5000);
+      const estimatedMarketValue = Number(req.body.estimatedMarketValue || startingPrice * 1.35);
+      const rawSlotKey =
+        typeof req.body.slotKey === 'string' && req.body.slotKey.trim()
+          ? req.body.slotKey.trim()
+          : null;
+
+      const { timeBetweenAuctionsMinutes, defaultSlotDurationMinutes } =
+        await getAuctionTimingConfig();
+
+      const startTime = rawSlotKey
+        ? new Date(rawSlotKey)
+        : req.body.startTime
+        ? new Date(req.body.startTime)
+        : new Date();
+      const endTime = rawSlotKey
+        ? new Date(startTime.getTime() + defaultSlotDurationMinutes * 60_000)
+        : req.body.endTime
+        ? new Date(req.body.endTime)
+        : new Date(startTime.getTime() + defaultSlotDurationMinutes * 60_000);
+
+      const slotKey = rawSlotKey || startTime.toISOString();
+
+      const imageUrls: string[] = Array.isArray(req.body.images)
+        ? req.body.images.filter((u: any) => typeof u === 'string' && u.trim().length > 0)
+        : [];
+      const specs: string[] = Array.isArray(req.body.specs)
+        ? req.body.specs.map((s: any) => sanitizeText(s, 80)).filter(Boolean)
+        : [];
+
+      if (title.length < 3) {
+        return res.status(400).json({ error: 'Product title must be at least 3 characters.' });
+      }
+      if (!Number.isFinite(startingPrice) || startingPrice <= 0) {
+        return res.status(400).json({ error: 'Starting price must be greater than zero.' });
+      }
+      if (!Number.isFinite(bidIncrement) || bidIncrement <= 0) {
+        return res.status(400).json({ error: 'Minimum bid increment must be greater than zero.' });
+      }
+      if (Number.isNaN(startTime.getTime()) || Number.isNaN(endTime.getTime())) {
+        return res.status(400).json({ error: 'Please select a valid live auction slot.' });
+      }
+      if (endTime.getTime() <= startTime.getTime()) {
+        return res.status(400).json({ error: 'Closing time must be after start time.' });
+      }
+      if (endTime.getTime() <= Date.now()) {
+        return res.status(400).json({ error: 'Selected auction slot has already ended.' });
+      }
+
+      let categoryName = sanitizeText(req.body.categoryName || 'Electronics', 60);
+      if (categoryId) {
+        const [cat] = await db
+          .select()
+          .from(auctionCategories)
+          .where(eq(auctionCategories.id, categoryId))
+          .limit(1);
+        if (cat) categoryName = cat.name;
+      }
+
+      const code = `LOT-NG-${Math.floor(100 + Math.random() * 900)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+      const slug = `${title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .slice(0, 60)}-${Date.now().toString().slice(-4)}`;
+
+      const isAdminAutoApprove = user.isAdmin;
+      const imgsToInsert =
+        imageUrls.length > 0
+          ? imageUrls
+          : ['/src/assets/images/hero_auction_showcase_1794582937386.jpg'];
+
+      const initialStatus =
+        isAdminAutoApprove && startTime.getTime() <= Date.now() ? 'live' : 'scheduled';
+
+      const created = await db.transaction(async (tx) => {
+        const conflict = await findSlotConflict(tx, {
+          slotStart: startTime,
+          slotEnd: endTime,
+          slotKey,
+          gapMinutes: timeBetweenAuctionsMinutes,
+        });
+        if (conflict) {
+          throw {
+            status: 409,
+            message: `That live auction slot conflicts with "${conflict.title}" (${conflict.code}) or the ${timeBetweenAuctionsMinutes}-minute gap between auctions. Please choose another available slot.`,
+          };
+        }
+
+        const [row] = await tx
+          .insert(auctions)
+          .values({
+            code,
+            title,
+            slug,
+            description,
+            categoryId,
+            categoryName,
+            condition,
+            brand,
+            location,
+            sellerId: user.id,
+            sellerName: user.fullName || user.username,
+            startingPrice: Math.round(startingPrice),
+            currentBid: Math.round(startingPrice),
+            bidIncrement: Math.round(bidIncrement),
+            estimatedMarketValue: Math.round(estimatedMarketValue),
+            status: initialStatus,
+            approvalStatus: isAdminAutoApprove ? 'approved' : 'pending',
+            queueOrder: 100,
+            slotKey,
+            startTime,
+            endTime,
+            effectiveEndTime: endTime,
+            isFeatured: false,
+            specs,
+            createdBy: user.id,
+          })
+          .returning();
+
+        await tx.insert(auctionImages).values(
+          imgsToInsert.map((url, idx) => ({
+            auctionId: row.id,
+            imageUrl: url.trim(),
+            sortOrder: idx,
+            isPrimary: idx === 0,
+          }))
+        );
+
+        return row;
+      });
+
+      clearSlotHold(slotKey, io);
+
+      // Notify seller
+      await db.insert(notifications).values({
+        userId: user.id,
+        type: 'product_submitted',
+        title: isAdminAutoApprove ? 'Product Published to Live Slot' : 'Product & Slot Reserved for Review',
+        message: isAdminAutoApprove
+          ? `Your product "${created.title}" (${created.code}) is scheduled for the ${startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} slot.`
+          : `Your product "${created.title}" (${created.code}) reserved its live slot and awaits administrator approval.`,
+        auctionId: created.id,
+      });
+
+      // Notify admins if pending approval
+      if (!isAdminAutoApprove) {
+        const activeAdmins = await db
+          .select({ id: users.id })
+          .from(users)
+          .where(and(eq(users.isAdmin, true), eq(users.status, 'active')));
+
+        for (const adm of activeAdmins) {
+          const msg = `@${user.username} submitted "${created.title}" (${created.code}) for slot ${startTime.toLocaleString()} at ₦${created.startingPrice.toLocaleString()}.`;
+          await db.insert(notifications).values({
+            userId: adm.id,
+            type: 'admin_product_submitted',
+            title: 'New Seller Product Awaiting Approval',
+            message: msg,
+            auctionId: created.id,
+          });
+          io.emit('notification:user', {
+            userId: adm.id,
+            type: 'admin_product_submitted',
+            title: 'New Product Awaiting Approval',
+            message: msg,
+            auctionId: created.id,
+          });
+        }
+        io.emit('notification:admin', {
+          type: 'admin_product_submitted',
+          title: 'New Product Awaiting Approval',
+          message: `@${user.username} reserved a slot for "${created.title}".`,
+          auctionId: created.id,
+        });
+      }
+
+      // Real-time broadcast for slot schedule & catalog
+      io.emit('slots:updated', {
+        action: 'reserved',
+        slotKey,
+        auctionId: created.id,
+      });
+      io.emit('auction:updated', { auctionId: created.id, status: created.status });
+
+      res.status(201).json({
+        auction: { ...created, images: imgsToInsert },
+        message: isAdminAutoApprove
+          ? `Product ${created.code} scheduled in live auction slot!`
+          : `Product ${created.code} submitted and live auction slot reserved! An administrator will approve it shortly.`,
+      });
+    } catch (err: any) {
+      if (err?.status && err?.message) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      console.error('POST /user/products error:', err);
+      res.status(500).json({ error: 'Failed to submit product for bidding.' });
     }
   });
 

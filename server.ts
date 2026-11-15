@@ -6,12 +6,12 @@ import { fileURLToPath } from 'url';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import { Server as SocketIOServer } from 'socket.io';
-import { createServer as createViteServer } from 'vite';
 import { attachSession, requireCsrf } from './src/server/authMiddleware.ts';
 import authRouter from './src/server/routes/auth.ts';
 import { createAuctionsRouter } from './src/server/routes/auctions.ts';
 import { createAdminRouter } from './src/server/routes/admin.ts';
 import { startAuctionLifecycleWorker } from './src/server/auctionWorker.ts';
+import { registerSlotSocketHandlers } from './src/server/slotManager.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,8 +41,8 @@ async function startServer() {
   );
 
   app.use(cookieParser());
-  app.use(express.json({ limit: '5mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+  app.use(express.json({ limit: '12mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '12mb' }));
 
   // Attach authenticated user & rotating HTTP-only session
   app.use('/api', attachSession);
@@ -59,6 +59,7 @@ async function startServer() {
   });
 
   // Socket.IO connection tracking
+  registerSlotSocketHandlers(io);
   io.on('connection', (socket) => {
     socket.on('auction:join', (auctionId: number) => {
       if (Number.isInteger(auctionId)) {
@@ -70,6 +71,7 @@ async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
 
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

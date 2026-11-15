@@ -96,14 +96,14 @@ export const RecentBidsTicker: React.FC<RecentBidsTickerProps> = ({ latestLiveBi
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping shrink-0" />
             <span className="uppercase">Live Verified Wins</span>
           </div>
-          <span className="hidden sm:inline text-slate-400 text-[11px]">
+          <span className="text-slate-400 text-[11px]">
             Recent successful bids across all categories
           </span>
         </div>
 
         {/* Center/Right: Category Quick Filters & Controls */}
         <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5 max-w-full">
-          <span className="text-[10px] text-slate-400 uppercase font-bold flex items-center gap-1 mr-1 hidden md:flex">
+          <span className="text-[10px] text-slate-400 uppercase font-bold flex items-center gap-1 mr-1 shrink-0">
             <Filter className="w-3 h-3" /> Filter:
           </span>
           {categories.map(cat => (
@@ -131,7 +131,7 @@ export const RecentBidsTicker: React.FC<RecentBidsTickerProps> = ({ latestLiveBi
           </button>
 
           {/* Manual step controls */}
-          <div className="hidden sm:flex items-center gap-0.5 ml-1 shrink-0">
+          <div className="flex items-center gap-0.5 ml-1 shrink-0">
             <button
               onClick={() => handleManualScroll('left')}
               className="p-1 rounded-md bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 transition"
@@ -174,7 +174,7 @@ export const RecentBidsTicker: React.FC<RecentBidsTickerProps> = ({ latestLiveBi
             <div
               key={`${item.id}-${index}`}
               onClick={() => setActiveItemModal(item)}
-              className="group cursor-pointer flex items-center gap-2.5 bg-slate-800/90 hover:bg-slate-800 border border-slate-700/80 hover:border-emerald-500/50 rounded-xl px-3 py-2 text-xs transition duration-150 shadow-sm shrink-0 max-w-[340px] sm:max-w-[370px]"
+              className="group cursor-pointer flex items-center gap-2.5 bg-slate-800/90 hover:bg-slate-800 border border-slate-700/80 hover:border-emerald-500/50 rounded-xl px-3 py-2 text-xs transition duration-150 shadow-sm shrink-0 max-w-[270px] sm:max-w-[370px]"
             >
               {/* Category Icon / Badge */}
               <div className="w-8 h-8 rounded-lg bg-slate-700/80 border border-slate-600/50 flex items-center justify-center text-sm shrink-0 group-hover:scale-105 transition">
@@ -214,7 +214,7 @@ export const RecentBidsTicker: React.FC<RecentBidsTickerProps> = ({ latestLiveBi
               </div>
 
               {/* Location Tag */}
-              <div className="hidden sm:flex flex-col items-end text-right shrink-0 border-l border-slate-700/60 pl-2">
+              <div className="flex flex-col items-end text-right shrink-0 border-l border-slate-700/60 pl-2">
                 <span className="text-[10px] text-slate-400 flex items-center gap-0.5">
                   <MapPin className="w-2.5 h-2.5 text-rose-400 shrink-0" />
                   {item.location.split(',')[0]}

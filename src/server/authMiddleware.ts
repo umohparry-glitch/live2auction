@@ -1,4 +1,4 @@
-import { NextFunction, Request, Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import { and, eq, gt, isNull } from 'drizzle-orm';
 import { db } from '../db/index.ts';
 import { ensureSeeded } from '../db/seed.ts';
@@ -30,6 +30,8 @@ export interface AuthContext {
     emailVerified: boolean;
     mustChangePassword: boolean;
     isAdmin: boolean;
+    canPostProducts: boolean;
+    sellerApprovalRequested: boolean;
     createdAt: Date;
     lastLoginAt: Date | null;
   };
@@ -136,6 +138,8 @@ async function resolveSessionFromDb(rawToken: string) {
       emailVerified: users.emailVerified,
       mustChangePassword: users.mustChangePassword,
       isAdmin: users.isAdmin,
+      canPostProducts: users.canPostProducts,
+      sellerApprovalRequested: users.sellerApprovalRequested,
       createdAt: users.createdAt,
       lastLoginAt: users.lastLoginAt,
     })

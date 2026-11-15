@@ -28,6 +28,8 @@ export const users = pgTable(
     emailVerified: boolean('email_verified').default(false).notNull(),
     mustChangePassword: boolean('must_change_password').default(false).notNull(),
     isAdmin: boolean('is_admin').default(false).notNull(),
+    canPostProducts: boolean('can_post_products').default(false).notNull(),
+    sellerApprovalRequested: boolean('seller_approval_requested').default(false).notNull(),
     lastLoginAt: timestamp('last_login_at'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -204,6 +206,10 @@ export const auctions = pgTable(
     reservePrice: bigint('reserve_price', { mode: 'number' }),
     estimatedMarketValue: bigint('estimated_market_value', { mode: 'number' }).notNull(),
     status: text('status').default('scheduled').notNull(), // draft | scheduled | live | paused | ended | cancelled
+    approvalStatus: text('approval_status').default('approved').notNull(), // pending | approved | rejected
+    rejectionReason: text('rejection_reason').default('').notNull(),
+    queueOrder: integer('queue_order').default(100).notNull(),
+    slotKey: text('slot_key'),
     startTime: timestamp('start_time').notNull(),
     endTime: timestamp('end_time').notNull(),
     effectiveEndTime: timestamp('effective_end_time').notNull(),
@@ -214,6 +220,7 @@ export const auctions = pgTable(
     }),
     winnerUsername: text('winner_username'),
     winningBidAmount: bigint('winning_bid_amount', { mode: 'number' }),
+    winnerStatus: text('winner_status').default('pending').notNull(), // pending | notified | escrow_paid | dispatched | settled
     bidsCount: integer('bids_count').default(0).notNull(),
     isFeatured: boolean('is_featured').default(false).notNull(),
     specs: jsonb('specs').$type<string[]>().default([]).notNull(),
@@ -227,6 +234,9 @@ export const auctions = pgTable(
     index('auctions_status_idx').on(table.status),
     index('auctions_category_idx').on(table.categoryId),
     index('auctions_end_time_idx').on(table.effectiveEndTime),
+    index('auctions_queue_order_idx').on(table.queueOrder),
+    index('auctions_approval_status_idx').on(table.approvalStatus),
+    index('auctions_slot_key_idx').on(table.slotKey),
   ]
 );
 
@@ -384,6 +394,8 @@ export const websiteSettings = pgTable('website_settings', {
   requireEmailVerification: boolean('require_email_verification').default(false).notNull(),
   defaultBidIncrement: integer('default_bid_increment').default(5000).notNull(),
   antiSnipingSeconds: integer('anti_sniping_seconds').default(60).notNull(),
+  timeBetweenAuctionsMinutes: integer('time_between_auctions_minutes').default(15).notNull(),
+  defaultSlotDurationMinutes: integer('default_slot_duration_minutes').default(60).notNull(),
   updatedBy: integer('updated_by').references(() => users.id, { onDelete: 'set null' }),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });

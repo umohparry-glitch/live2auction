@@ -8,6 +8,7 @@ import { PublicMarketplace, PublicAuctionItem } from './components/PublicMarketp
 import { PublicAuctionDetail } from './components/PublicAuctionDetail';
 import { PublicPages } from './components/PublicPages';
 import { UserDashboard } from './components/UserDashboard';
+import { PostProductBiddingView } from './components/PostProductBiddingView';
 import { AdminDashboardFull } from './components/AdminDashboardFull';
 import { LiveAuctionRoom } from './components/LiveAuctionRoom';
 import { AuthModal } from './components/AuthModal';
@@ -68,7 +69,7 @@ function AppShell() {
   }
 
   return (
-    <div className="min-h-screen bg-white text-slate-900 flex flex-col font-sans">
+    <div className="min-h-screen bg-white text-slate-900 flex flex-col font-sans overflow-x-clip">
       <TopNavHeader currentPage={currentPage} onNavigate={navigateTo} />
 
       {/* Watchlist 2-min Browser Notification Banner */}
@@ -76,7 +77,7 @@ function AppShell() {
 
       {/* Global Toast Notification */}
       {toast && (
-        <div className="fixed bottom-5 right-5 z-50 max-w-sm w-full px-4">
+        <div className="fixed bottom-20 lg:bottom-5 left-3 right-3 sm:left-auto sm:right-5 z-50 sm:max-w-sm sm:w-full">
           <div
             className={`p-4 rounded-xl border shadow-xl bg-white flex items-start gap-3 text-xs ${
               toast.type === 'error'
@@ -160,6 +161,34 @@ function AppShell() {
               )
             )}
 
+            {currentPage === 'post_product' && (
+              isAuthenticated ? (
+                <PostProductBiddingView
+                  onOpenAuction={(id) => {
+                    setCurrentPage('home');
+                    handleOpenAuction(id);
+                  }}
+                  onGoToDashboard={() => navigateTo('dashboard')}
+                />
+              ) : (
+                <div className="max-w-lg mx-auto px-4 py-20 text-center space-y-4">
+                  <ShieldCheck className="w-10 h-10 text-emerald-600 mx-auto" />
+                  <h2 className="text-xl font-bold text-slate-900">
+                    Authentication Required to Post a Product
+                  </h2>
+                  <p className="text-sm text-slate-600">
+                    Create a free account or log in to select a live auction slot and post your product for bidding.
+                  </p>
+                  <button
+                    onClick={() => requireAuthentication(() => navigateTo('post_product'))}
+                    className="px-5 py-2.5 bg-emerald-600 text-white text-xs font-semibold rounded-lg cursor-pointer"
+                  >
+                    Login or Create Account
+                  </button>
+                </div>
+              )
+            )}
+
             {(currentPage === 'about' ||
               currentPage === 'contact' ||
               currentPage === 'terms' ||
@@ -196,25 +225,25 @@ function AppShell() {
       </main>
 
       {/* Clean Footer */}
-      <footer className="border-t border-slate-200 bg-white py-8 px-4 sm:px-6 lg:px-8 mt-auto">
+      <footer className="border-t border-slate-200 bg-white pt-8 pb-20 lg:pb-8 px-4 sm:px-6 lg:px-8 mt-auto">
         <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4 text-xs text-slate-500">
-          <div>
+          <div className="text-center md:text-left">
             © {new Date().getFullYear()} {siteName}. Protected Escrow & Server-Authoritative Live Bidding.
           </div>
-          <div className="flex flex-wrap items-center gap-5">
-            <button onClick={() => navigateTo('about')} className="hover:text-slate-900 cursor-pointer">
+          <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2">
+            <button onClick={() => navigateTo('about')} className="py-1.5 hover:text-slate-900 cursor-pointer">
               About Us
             </button>
-            <button onClick={() => navigateTo('contact')} className="hover:text-slate-900 cursor-pointer">
+            <button onClick={() => navigateTo('contact')} className="py-1.5 hover:text-slate-900 cursor-pointer">
               Contact Us
             </button>
-            <button onClick={() => navigateTo('terms')} className="hover:text-slate-900 cursor-pointer">
+            <button onClick={() => navigateTo('terms')} className="py-1.5 hover:text-slate-900 cursor-pointer">
               Terms & Conditions
             </button>
-            <button onClick={() => navigateTo('privacy')} className="hover:text-slate-900 cursor-pointer">
+            <button onClick={() => navigateTo('privacy')} className="py-1.5 hover:text-slate-900 cursor-pointer">
               Privacy Policy
             </button>
-            <button onClick={() => navigateTo('admin')} className="hover:text-slate-900 font-semibold cursor-pointer">
+            <button onClick={() => navigateTo('admin')} className="py-1.5 hover:text-slate-900 font-semibold cursor-pointer">
               Admin Portal
             </button>
           </div>

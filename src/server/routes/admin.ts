@@ -1,11 +1,12 @@
 import { Router } from 'express';
-import { and, desc, eq, inArray, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, or, sql } from 'drizzle-orm';
 import crypto from 'crypto';
-import { Server as SocketIOServer } from 'socket.io';
+import type { Server as SocketIOServer } from 'socket.io';
 import { db } from '../../db/index.ts';
 import {
   adminActivityLogs,
   auctionCategories,
+  auctionDiscussions,
   auctionImages,
   auctions,
   bids,
@@ -19,7 +20,7 @@ import {
   websiteSettings,
 } from '../../db/schema.ts';
 import {
-  AuthRequest,
+  type AuthRequest,
   loadUserRolesAndPermissions,
   logAdminAction,
   requireAdmin,
@@ -35,6 +36,7 @@ import {
   sanitizeText,
   validatePasswordStrength,
 } from '../security.ts';
+import { notifyAuctionWinnerAndAdmins } from '../auctionWorker.ts';
 
 export function createAdminRouter(io: SocketIOServer) {
   const router = Router();
@@ -105,6 +107,234 @@ export function createAdminRouter(io: SocketIOServer) {
         .from(auctions)
         .groupBy(auctions.categoryName);
 
+      const [pendingRequestsCount] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(users)
+        .where(and(eq(users.sellerApprovalRequested, true), eq(users.canPostProducts, false)));
+
+      const [pendingProductsCount] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(auctions)
+        .where(eq(auctions.approvalStatus, 'pending'));
+
+      const recentWinners = await db
+        .select({
+          auctionId: auctions.id,
+          code: auctions.code,
+          title: auctions.title,
+          winnerUsername: auctions.winnerUsername,
+          winningBidAmount: auctions.winningBidAmount,
+          winnerStatus: auctions.winnerStatus,
+          effectiveEndTime: auctions.effectiveEndTime,
+        })
+        .from(auctions)
+        .where(and(eq(auctions.status, 'ended'), isNotNull(auctions.winnerId)))
+        .orderBy(desc(auctions.updatedAt))
+        .limit(8);
+
+      // ================= RECHARTS ANALYTICS TIME-SERIES =================
+      const now = new Date();
+      const daysWindow = 14;
+
+      // 1) Daily bids, bid volume, and distinct active bidders (14 days)
+      const dailyBidsRows = await db.execute(sql`
+        SELECT
+          to_char(date_trunc('day', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day_key,
+          count(*)::int AS bids_count,
+          count(DISTINCT user_id)::int AS active_bidders,
+          coalesce(sum(amount), 0)::bigint AS bid_volume
+        FROM bids
+        WHERE created_at >= (date_trunc('day', NOW() AT TIME ZONE 'UTC') - INTERVAL '13 days')
+        GROUP BY 1
+        ORDER BY 1 ASC
+      `);
+
+      // 2) Baseline cumulative bid volume prior to 14-day window
+      const priorVolumeRows = await db.execute(sql`
+        SELECT
+          coalesce(sum(amount), 0)::bigint AS prior_volume
+        FROM bids
+        WHERE created_at < (date_trunc('day', NOW() AT TIME ZONE 'UTC') - INTERVAL '13 days')
+      `);
+      const priorBidVolume = Number((priorVolumeRows.rows?.[0] as any)?.prior_volume || 0);
+
+      // 3) Daily registrations (14 days)
+      const dailyUsersRows = await db.execute(sql`
+        SELECT
+          to_char(date_trunc('day', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day_key,
+          count(*)::int AS new_users
+        FROM users
+        WHERE created_at >= (date_trunc('day', NOW() AT TIME ZONE 'UTC') - INTERVAL '13 days')
+        GROUP BY 1
+        ORDER BY 1 ASC
+      `);
+
+      // 4) Daily discussion participants (14 days)
+      const dailyDiscussionRows = await db.execute(sql`
+        SELECT
+          to_char(date_trunc('day', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day_key,
+          count(DISTINCT user_id)::int AS discussion_users
+        FROM auction_discussions
+        WHERE created_at >= (date_trunc('day', NOW() AT TIME ZONE 'UTC') - INTERVAL '13 days')
+        GROUP BY 1
+        ORDER BY 1 ASC
+      `);
+
+      // 5) Daily settled auction volume (ended auctions with winner)
+      const dailySettledRows = await db.execute(sql`
+        SELECT
+          to_char(date_trunc('day', effective_end_time AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day_key,
+          coalesce(sum(winning_bid_amount), 0)::bigint AS settled_volume
+        FROM auctions
+        WHERE status = 'ended'
+          AND winner_id IS NOT NULL
+          AND effective_end_time >= (date_trunc('day', NOW() AT TIME ZONE 'UTC') - INTERVAL '13 days')
+        GROUP BY 1
+        ORDER BY 1 ASC
+      `);
+
+      // 6) Hourly bidding velocity (last 24 hours)
+      const hourlyBidsRows = await db.execute(sql`
+        SELECT
+          to_char(date_trunc('hour', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD"T"HH24') AS hour_key,
+          count(*)::int AS bids_count,
+          count(DISTINCT user_id)::int AS unique_bidders,
+          coalesce(sum(amount), 0)::bigint AS bid_volume
+        FROM bids
+        WHERE created_at >= (date_trunc('hour', NOW() AT TIME ZONE 'UTC') - INTERVAL '23 hours')
+        GROUP BY 1
+        ORDER BY 1 ASC
+      `);
+
+      // 7) Overall auction volume totals
+      const [volumeSummaryRow] = await db
+        .select({
+          totalAuctionVolume: sql<number>`coalesce(sum(${auctions.currentBid}), 0)::bigint`,
+          settledVolume: sql<number>`coalesce(sum(case when ${auctions.status} = 'ended' and ${auctions.winnerId} is not null then ${auctions.winningBidAmount} else 0 end), 0)::bigint`,
+        })
+        .from(auctions)
+        .where(sql`${auctions.status} != 'cancelled' AND ${auctions.status} != 'draft'`);
+
+      const [avgBidRow] = await db
+        .select({
+          avgBidAmount: sql<number>`coalesce(avg(${bids.amount}), 0)::bigint`,
+          totalHistoricalBidVolume: sql<number>`coalesce(sum(${bids.amount}), 0)::bigint`,
+        })
+        .from(bids);
+
+      const bidsByDay = new Map<string, { bidsCount: number; activeBidders: number; bidVolume: number }>();
+      for (const r of (dailyBidsRows.rows || []) as any[]) {
+        bidsByDay.set(String(r.day_key), {
+          bidsCount: Number(r.bids_count || 0),
+          activeBidders: Number(r.active_bidders || 0),
+          bidVolume: Number(r.bid_volume || 0),
+        });
+      }
+
+      const usersByDay = new Map<string, number>();
+      for (const r of (dailyUsersRows.rows || []) as any[]) {
+        usersByDay.set(String(r.day_key), Number(r.new_users || 0));
+      }
+
+      const discByDay = new Map<string, number>();
+      for (const r of (dailyDiscussionRows.rows || []) as any[]) {
+        discByDay.set(String(r.day_key), Number(r.discussion_users || 0));
+      }
+
+      const settledByDay = new Map<string, number>();
+      for (const r of (dailySettledRows.rows || []) as any[]) {
+        settledByDay.set(String(r.day_key), Number(r.settled_volume || 0));
+      }
+
+      const bidsByHour = new Map<string, { bidsCount: number; uniqueBidders: number; bidVolume: number }>();
+      for (const r of (hourlyBidsRows.rows || []) as any[]) {
+        bidsByHour.set(String(r.hour_key), {
+          bidsCount: Number(r.bids_count || 0),
+          uniqueBidders: Number(r.unique_bidders || 0),
+          bidVolume: Number(r.bid_volume || 0),
+        });
+      }
+
+      // Build continuous 14-day series
+      const dailySeries: Array<{
+        date: string;
+        label: string;
+        bidsCount: number;
+        dailyVolume: number;
+        settledVolume: number;
+        cumulativeVolume: number;
+        activeBidders: number;
+        discussionParticipants: number;
+        newRegistrations: number;
+        totalParticipation: number;
+      }> = [];
+
+      let runningCumulativeVolume = priorBidVolume;
+      for (let i = daysWindow - 1; i >= 0; i--) {
+        const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i));
+        const dayKey = d.toISOString().slice(0, 10);
+        const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+        const bStats = bidsByDay.get(dayKey) || { bidsCount: 0, activeBidders: 0, bidVolume: 0 };
+        const newRegs = usersByDay.get(dayKey) || 0;
+        const discUsers = discByDay.get(dayKey) || 0;
+        const settledVol = settledByDay.get(dayKey) || 0;
+        runningCumulativeVolume += bStats.bidVolume;
+
+        dailySeries.push({
+          date: dayKey,
+          label,
+          bidsCount: bStats.bidsCount,
+          dailyVolume: bStats.bidVolume,
+          settledVolume: settledVol,
+          cumulativeVolume: runningCumulativeVolume,
+          activeBidders: bStats.activeBidders,
+          discussionParticipants: discUsers,
+          newRegistrations: newRegs,
+          totalParticipation: bStats.activeBidders + discUsers + newRegs,
+        });
+      }
+
+      // Build continuous 24-hour velocity series
+      const hourlyVelocitySeries: Array<{
+        hourKey: string;
+        label: string;
+        bidsPerHour: number;
+        uniqueBidders: number;
+        bidVolume: number;
+      }> = [];
+
+      let bidsLast24h = 0;
+      let peakHourlyVelocity = 0;
+      for (let h = 23; h >= 0; h--) {
+        const dt = new Date(
+          Date.UTC(
+            now.getUTCFullYear(),
+            now.getUTCMonth(),
+            now.getUTCDate(),
+            now.getUTCHours() - h,
+            0,
+            0
+          )
+        );
+        const hourKey = dt.toISOString().slice(0, 13);
+        const label = `${String(dt.getUTCHours()).padStart(2, '0')}:00`;
+        const hStats = bidsByHour.get(hourKey) || { bidsCount: 0, uniqueBidders: 0, bidVolume: 0 };
+        bidsLast24h += hStats.bidsCount;
+        if (hStats.bidsCount > peakHourlyVelocity) {
+          peakHourlyVelocity = hStats.bidsCount;
+        }
+        hourlyVelocitySeries.push({
+          hourKey,
+          label,
+          bidsPerHour: hStats.bidsCount,
+          uniqueBidders: hStats.uniqueBidders,
+          bidVolume: hStats.bidVolume,
+        });
+      }
+
+      const bidsLastHour = hourlyVelocitySeries[hourlyVelocitySeries.length - 1]?.bidsPerHour || 0;
+      const todayMetrics = dailySeries[dailySeries.length - 1];
+
       res.json({
         kpis: {
           totalUsers: usersCount?.count || 0,
@@ -113,9 +343,34 @@ export function createAdminRouter(io: SocketIOServer) {
           upcomingAuctions: upcomingAuctionsCount?.count || 0,
           completedAuctions: completedAuctionsCount?.count || 0,
           totalBids: bidsCount?.count || 0,
+          pendingSellerRequests: pendingRequestsCount?.count || 0,
+          pendingProducts: pendingProductsCount?.count || 0,
+        },
+        analytics: {
+          velocitySummary: {
+            bidsLastHour,
+            bidsLast24h,
+            avgBidsPerHour: Number((bidsLast24h / 24).toFixed(1)),
+            peakHourlyVelocity,
+          },
+          volumeSummary: {
+            totalAuctionVolume: Number(volumeSummaryRow?.totalAuctionVolume || 0),
+            settledVolume: Number(volumeSummaryRow?.settledVolume || 0),
+            totalHistoricalBidVolume: Number(avgBidRow?.totalHistoricalBidVolume || 0),
+            avgBidAmount: Number(avgBidRow?.avgBidAmount || 0),
+          },
+          participationSummary: {
+            todayActiveBidders: todayMetrics?.activeBidders || 0,
+            todayNewRegistrations: todayMetrics?.newRegistrations || 0,
+            todayDiscussionUsers: todayMetrics?.discussionParticipants || 0,
+            fourteenDayBidTotal: dailySeries.reduce((sum, d) => sum + d.bidsCount, 0),
+          },
+          hourlyVelocitySeries,
+          dailySeries,
         },
         recentRegistrations,
         recentBids,
+        recentWinners,
         categoryStats: categoryStats.map((c) => ({
           category: c.category,
           count: c.count,
@@ -143,11 +398,13 @@ export function createAdminRouter(io: SocketIOServer) {
           status: users.status,
           emailVerified: users.emailVerified,
           isAdmin: users.isAdmin,
+          canPostProducts: users.canPostProducts,
+          sellerApprovalRequested: users.sellerApprovalRequested,
           lastLoginAt: users.lastLoginAt,
           createdAt: users.createdAt,
         })
         .from(users)
-        .orderBy(desc(users.createdAt));
+        .orderBy(desc(users.sellerApprovalRequested), desc(users.createdAt));
 
       const roleRows = await db
         .select({
@@ -228,6 +485,11 @@ export function createAdminRouter(io: SocketIOServer) {
         return res.status(409).json({ error: 'Username or email already exists.' });
       }
 
+      const canPostProducts =
+        req.body.canPostProducts !== undefined
+          ? Boolean(req.body.canPostProducts)
+          : roleName === 'seller';
+
       const passwordHash = await hashPassword(password);
       const [created] = await db
         .insert(users)
@@ -242,6 +504,8 @@ export function createAdminRouter(io: SocketIOServer) {
           emailVerified: true,
           mustChangePassword: false,
           isAdmin: false,
+          canPostProducts,
+          sellerApprovalRequested: false,
         })
         .returning();
 
@@ -300,6 +564,11 @@ export function createAdminRouter(io: SocketIOServer) {
         return res.status(400).json({ error: 'Invalid email address.' });
       }
 
+      const nextCanPostProducts =
+        typeof req.body.canPostProducts === 'boolean'
+          ? req.body.canPostProducts
+          : existing.canPostProducts;
+
       const [updated] = await db
         .update(users)
         .set({
@@ -309,10 +578,58 @@ export function createAdminRouter(io: SocketIOServer) {
           status,
           emailVerified:
             req.body.emailVerified !== undefined ? Boolean(req.body.emailVerified) : existing.emailVerified,
+          canPostProducts: nextCanPostProducts,
+          sellerApprovalRequested: nextCanPostProducts ? false : existing.sellerApprovalRequested,
           updatedAt: new Date(),
         })
         .where(eq(users.id, targetId))
         .returning();
+
+      // Sync seller role when posting permission changes
+      if (typeof req.body.canPostProducts === 'boolean' && req.body.canPostProducts !== existing.canPostProducts) {
+        const [sellerRole] = await db
+          .select()
+          .from(roles)
+          .where(eq(roles.name, 'seller'))
+          .limit(1);
+        if (sellerRole) {
+          if (req.body.canPostProducts) {
+            await db
+              .insert(userRoles)
+              .values({
+                userId: targetId,
+                roleId: sellerRole.id,
+                assignedBy: req.auth!.user.id,
+              })
+              .onConflictDoNothing();
+          } else {
+            await db
+              .delete(userRoles)
+              .where(and(eq(userRoles.userId, targetId), eq(userRoles.roleId, sellerRole.id)));
+          }
+        }
+
+        const notifTitle = req.body.canPostProducts
+          ? 'Approved to Post Products for Bidding'
+          : 'Product Posting Permission Revoked';
+        const notifMessage = req.body.canPostProducts
+          ? 'An administrator has approved your account to post products for auction bidding in your dashboard.'
+          : 'Your permission to post new products for bidding has been revoked by an administrator.';
+
+        await db.insert(notifications).values({
+          userId: targetId,
+          type: req.body.canPostProducts ? 'seller_approved' : 'seller_revoked',
+          title: notifTitle,
+          message: notifMessage,
+        });
+
+        io.emit('notification:user', {
+          userId: targetId,
+          type: req.body.canPostProducts ? 'seller_approved' : 'seller_revoked',
+          title: notifTitle,
+          message: notifMessage,
+        });
+      }
 
       // If suspended/banned/deactivated, revoke active sessions immediately
       if (status !== 'active') {
@@ -339,7 +656,7 @@ export function createAdminRouter(io: SocketIOServer) {
         'USER_UPDATED',
         'User',
         targetId,
-        `Updated @${updated.username} (status: ${existing.status} -> ${status})`
+        `Updated @${updated.username} (status: ${existing.status} -> ${status}, canPostProducts: ${nextCanPostProducts})`
       );
 
       const { passwordHash: _ph, ...safeUser } = updated;
@@ -695,7 +1012,11 @@ export function createAdminRouter(io: SocketIOServer) {
   // ================= C. AUCTION & CATEGORY MANAGEMENT =================
   router.get('/auctions', requirePermission('manage_auctions'), async (_req, res) => {
     try {
-      const all = await db.select().from(auctions).orderBy(desc(auctions.createdAt));
+      const all = await db
+        .select()
+        .from(auctions)
+        .orderBy(asc(auctions.queueOrder), desc(auctions.createdAt));
+
       const ids = all.map((a) => a.id);
       const imgs =
         ids.length > 0
@@ -712,10 +1033,23 @@ export function createAdminRouter(io: SocketIOServer) {
         imgMap.set(im.auctionId, list);
       }
 
+      const sellerIds = Array.from(
+        new Set(all.map((a) => a.sellerId).filter((id): id is number => Boolean(id)))
+      );
+      const sellerRows =
+        sellerIds.length > 0
+          ? await db
+              .select({ id: users.id, username: users.username, email: users.email })
+              .from(users)
+              .where(inArray(users.id, sellerIds))
+          : [];
+      const sellerMap = new Map(sellerRows.map((s) => [s.id, s]));
+
       res.json({
         auctions: all.map((a) => ({
           ...a,
           images: imgMap.get(a.id) || [],
+          sellerUsername: a.sellerId ? sellerMap.get(a.sellerId)?.username || null : null,
         })),
       });
     } catch (err) {
@@ -723,6 +1057,46 @@ export function createAdminRouter(io: SocketIOServer) {
       res.status(500).json({ error: 'Failed to load auctions.' });
     }
   });
+
+  // Arrange which product comes first in public catalog & auction queue
+  router.put(
+    '/auctions/reorder',
+    requirePermission('manage_auctions'),
+    async (req: AuthRequest, res) => {
+      try {
+        const orderedIds: number[] = Array.isArray(req.body.orderedIds)
+          ? req.body.orderedIds.map((id: any) => Number(id)).filter((id: number) => Number.isInteger(id) && id > 0)
+          : [];
+
+        if (orderedIds.length === 0) {
+          return res.status(400).json({ error: 'Provide an ordered list of auction IDs.' });
+        }
+
+        await db.transaction(async (tx) => {
+          for (let i = 0; i < orderedIds.length; i++) {
+            await tx
+              .update(auctions)
+              .set({ queueOrder: i + 1, updatedAt: new Date() })
+              .where(eq(auctions.id, orderedIds[i]));
+          }
+        });
+
+        await logAdminAction(
+          req,
+          'AUCTIONS_REORDERED',
+          'Auction',
+          orderedIds[0],
+          `Reordered auction queue priority (${orderedIds.length} lots, #1 ID: ${orderedIds[0]})`
+        );
+
+        io.emit('auction:updated', { reordered: true });
+        res.json({ success: true, message: 'Product display order saved.' });
+      } catch (err) {
+        console.error('PUT /admin/auctions/reorder error:', err);
+        res.status(500).json({ error: 'Failed to update product order.' });
+      }
+    }
+  );
 
   router.post('/auctions', requirePermission('manage_auctions'), async (req: AuthRequest, res) => {
     try {
@@ -737,6 +1111,13 @@ export function createAdminRouter(io: SocketIOServer) {
       const bidIncrement = Number(req.body.bidIncrement || 5000);
       const reservePrice = req.body.reservePrice ? Number(req.body.reservePrice) : null;
       const estimatedMarketValue = Number(req.body.estimatedMarketValue || startingPrice * 1.4);
+      const putFirst = Boolean(req.body.putFirst);
+      const requestedOrder = Number(req.body.queueOrder);
+      const queueOrder = putFirst
+        ? 1
+        : Number.isFinite(requestedOrder) && requestedOrder > 0
+        ? Math.round(requestedOrder)
+        : 100;
       const status =
         typeof req.body.status === 'string' &&
         ['draft', 'scheduled', 'live'].includes(req.body.status)
@@ -774,6 +1155,13 @@ export function createAdminRouter(io: SocketIOServer) {
         if (cat) categoryName = cat.name;
       }
 
+      // If admin asked to place this product first, shift existing queue orders down
+      if (putFirst) {
+        await db
+          .update(auctions)
+          .set({ queueOrder: sql`${auctions.queueOrder} + 1` });
+      }
+
       const code = `LOT-NG-${Math.floor(100 + Math.random() * 900)}-${Date.now().toString().slice(-3)}`;
       const slug = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 60)}-${Date.now().toString().slice(-4)}`;
 
@@ -796,6 +1184,8 @@ export function createAdminRouter(io: SocketIOServer) {
           reservePrice: reservePrice ? Math.round(reservePrice) : null,
           estimatedMarketValue: Math.round(estimatedMarketValue),
           status,
+          approvalStatus: 'approved',
+          queueOrder,
           startTime,
           endTime,
           effectiveEndTime: endTime,
@@ -824,10 +1214,11 @@ export function createAdminRouter(io: SocketIOServer) {
         'AUCTION_CREATED',
         'Auction',
         created.id,
-        `Created auction ${created.code}: "${created.title}" (${created.status})`
+        `Created auction ${created.code}: "${created.title}" (${created.status}, order #${queueOrder})`
       );
 
       io.emit('auction:updated', { auctionId: created.id, status: created.status });
+      io.emit('slots:updated', { auctionId: created.id, action: 'created' });
 
       res.status(201).json({
         auction: { ...created, images: imgsToInsert },
@@ -839,7 +1230,7 @@ export function createAdminRouter(io: SocketIOServer) {
     }
   });
 
-  // Update / Start / Pause / Close / Cancel auction
+  // Update / Approve / Reject / Reorder / Start / Pause / Close / Cancel auction
   router.patch('/auctions/:id', requirePermission('manage_auctions'), async (req: AuthRequest, res) => {
     try {
       const auctionId = Number(req.params.id);
@@ -851,6 +1242,22 @@ export function createAdminRouter(io: SocketIOServer) {
         ['draft', 'scheduled', 'live', 'paused', 'ended', 'cancelled'].includes(req.body.status)
           ? req.body.status
           : existing.status;
+
+      const nextApprovalStatus =
+        typeof req.body.approvalStatus === 'string' &&
+        ['pending', 'approved', 'rejected'].includes(req.body.approvalStatus)
+          ? req.body.approvalStatus
+          : existing.approvalStatus;
+
+      const rejectionReason =
+        req.body.rejectionReason !== undefined
+          ? sanitizeText(req.body.rejectionReason, 400)
+          : existing.rejectionReason;
+
+      const queueOrder =
+        req.body.queueOrder !== undefined && Number.isFinite(Number(req.body.queueOrder))
+          ? Math.max(1, Math.round(Number(req.body.queueOrder)))
+          : existing.queueOrder;
 
       const patch: Record<string, any> = {
         title: req.body.title !== undefined ? sanitizeText(req.body.title, 160) : existing.title,
@@ -873,6 +1280,9 @@ export function createAdminRouter(io: SocketIOServer) {
               : null
             : existing.reservePrice,
         status: nextStatus,
+        approvalStatus: nextApprovalStatus,
+        rejectionReason,
+        queueOrder,
         isFeatured:
           req.body.isFeatured !== undefined ? Boolean(req.body.isFeatured) : existing.isFeatured,
         updatedAt: new Date(),
@@ -887,8 +1297,10 @@ export function createAdminRouter(io: SocketIOServer) {
         patch.categoryName = sanitizeText(req.body.categoryName, 60);
       }
 
-      // If closing auction manually, finalize winner & notify participants
-      if (nextStatus === 'ended' && existing.status !== 'ended') {
+      // If closing auction manually, finalize winner & notify both winner AND all admins AND seller
+      let topBidForNotify: { userId: number; username: string; amount: number } | null = null;
+      const didCloseNow = nextStatus === 'ended' && existing.status !== 'ended';
+      if (didCloseNow) {
         const [topBid] = await db
           .select()
           .from(bids)
@@ -900,14 +1312,12 @@ export function createAdminRouter(io: SocketIOServer) {
           patch.winnerId = topBid.userId;
           patch.winnerUsername = topBid.username;
           patch.winningBidAmount = topBid.amount;
-
-          await db.insert(notifications).values({
+          patch.winnerStatus = 'notified';
+          topBidForNotify = {
             userId: topBid.userId,
-            type: 'auction_won',
-            title: 'Congratulations! You Won an Auction',
-            message: `You won "${existing.title}" with a winning bid of ₦${topBid.amount.toLocaleString()}.`,
-            auctionId,
-          });
+            username: topBid.username,
+            amount: topBid.amount,
+          };
         }
       }
 
@@ -916,6 +1326,51 @@ export function createAdminRouter(io: SocketIOServer) {
         .set(patch)
         .where(eq(auctions.id, auctionId))
         .returning();
+
+      // Notify seller if approval status changed
+      if (nextApprovalStatus !== existing.approvalStatus && existing.sellerId) {
+        const approved = nextApprovalStatus === 'approved';
+        const sellerTitle = approved
+          ? `Product Approved: ${existing.code}`
+          : `Product Submission Rejected: ${existing.code}`;
+        const sellerMsg = approved
+          ? `Your submitted product "${updated.title}" has been approved by an administrator and is now ${updated.status === 'live' ? 'LIVE for bidding' : 'scheduled for auction'}.`
+          : `Your product "${updated.title}" was not approved.${rejectionReason ? ` Reason: ${rejectionReason}` : ''}`;
+
+        await db.insert(notifications).values({
+          userId: existing.sellerId,
+          type: approved ? 'product_approved' : 'product_rejected',
+          title: sellerTitle,
+          message: sellerMsg,
+          auctionId,
+        });
+        io.emit('notification:user', {
+          userId: existing.sellerId,
+          type: approved ? 'product_approved' : 'product_rejected',
+          title: sellerTitle,
+          message: sellerMsg,
+          auctionId,
+        });
+      }
+
+      // Trigger full winner + admin + seller + losers notifications on manual close
+      if (didCloseNow) {
+        await notifyAuctionWinnerAndAdmins(
+          io,
+          {
+            id: auctionId,
+            code: existing.code,
+            title: updated.title,
+            sellerId: existing.sellerId,
+          },
+          topBidForNotify
+        );
+        io.emit('auction:closed', {
+          auctionId,
+          winnerUsername: updated.winnerUsername ?? null,
+          winningBidAmount: updated.winningBidAmount ?? null,
+        });
+      }
 
       if (Array.isArray(req.body.images)) {
         const validImages = req.body.images
@@ -939,10 +1394,11 @@ export function createAdminRouter(io: SocketIOServer) {
         'AUCTION_UPDATED',
         'Auction',
         auctionId,
-        `Updated ${existing.code} (status: ${existing.status} -> ${nextStatus})`
+        `Updated ${existing.code} (status: ${existing.status} -> ${nextStatus}, approval: ${existing.approvalStatus} -> ${nextApprovalStatus})`
       );
 
       io.emit('auction:updated', { auctionId, status: nextStatus });
+      io.emit('slots:updated', { auctionId, status: nextStatus, approvalStatus: nextApprovalStatus });
 
       res.json({ auction: updated, message: `Auction ${existing.code} updated.` });
     } catch (err) {
@@ -967,6 +1423,240 @@ export function createAdminRouter(io: SocketIOServer) {
     }
   });
 
+  // ================= WINNER TRACKING & SETTLEMENTS =================
+  router.get('/winners', requirePermission('manage_bids'), async (_req, res) => {
+    try {
+      const rows = await db
+        .select()
+        .from(auctions)
+        .where(or(eq(auctions.status, 'ended'), isNotNull(auctions.winnerId)))
+        .orderBy(desc(auctions.updatedAt));
+
+      const winnerIds = Array.from(
+        new Set(rows.map((r) => r.winnerId).filter((id): id is number => Boolean(id)))
+      );
+      const winnerUsers =
+        winnerIds.length > 0
+          ? await db
+              .select({
+                id: users.id,
+                fullName: users.fullName,
+                username: users.username,
+                email: users.email,
+                phone: users.phone,
+              })
+              .from(users)
+              .where(inArray(users.id, winnerIds))
+          : [];
+      const winnerMap = new Map(winnerUsers.map((u) => [u.id, u]));
+
+      const auctionIds = rows.map((r) => r.id);
+      const imgRows =
+        auctionIds.length > 0
+          ? await db
+              .select()
+              .from(auctionImages)
+              .where(inArray(auctionImages.auctionId, auctionIds))
+              .orderBy(auctionImages.sortOrder)
+          : [];
+      const primaryImgMap = new Map<number, string>();
+      for (const im of imgRows) {
+        if (!primaryImgMap.has(im.auctionId)) {
+          primaryImgMap.set(im.auctionId, im.imageUrl);
+        }
+      }
+
+      res.json({
+        winners: rows.map((r) => ({
+          auctionId: r.id,
+          code: r.code,
+          title: r.title,
+          categoryName: r.categoryName,
+          status: r.status,
+          startingPrice: r.startingPrice,
+          currentBid: r.currentBid,
+          winningBidAmount: r.winningBidAmount ?? r.currentBid,
+          bidsCount: r.bidsCount,
+          winnerId: r.winnerId,
+          winnerUsername: r.winnerUsername,
+          winnerStatus: r.winnerStatus,
+          winnerDetails: r.winnerId ? winnerMap.get(r.winnerId) || null : null,
+          effectiveEndTime: r.effectiveEndTime,
+          imageUrl: primaryImgMap.get(r.id) || '',
+        })),
+      });
+    } catch (err) {
+      console.error('GET /admin/winners error:', err);
+      res.status(500).json({ error: 'Failed to load bid winners.' });
+    }
+  });
+
+  router.patch(
+    '/winners/:auctionId/status',
+    requirePermission('manage_bids'),
+    async (req: AuthRequest, res) => {
+      try {
+        const auctionId = Number(req.params.auctionId);
+        const winnerStatus =
+          typeof req.body.winnerStatus === 'string' &&
+          ['pending', 'notified', 'escrow_paid', 'dispatched', 'settled'].includes(
+            req.body.winnerStatus
+          )
+            ? req.body.winnerStatus
+            : null;
+        if (!winnerStatus) {
+          return res.status(400).json({ error: 'Invalid settlement status.' });
+        }
+
+        const [existing] = await db
+          .select()
+          .from(auctions)
+          .where(eq(auctions.id, auctionId))
+          .limit(1);
+        if (!existing) return res.status(404).json({ error: 'Auction not found.' });
+
+        const [updated] = await db
+          .update(auctions)
+          .set({ winnerStatus, updatedAt: new Date() })
+          .where(eq(auctions.id, auctionId))
+          .returning();
+
+        if (existing.winnerId) {
+          const statusLabels: Record<string, string> = {
+            pending: 'Pending Contact',
+            notified: 'Winner Notified',
+            escrow_paid: 'Escrow Payment Confirmed',
+            dispatched: 'Item Dispatched / In Transit',
+            settled: 'Order Completed & Settled',
+          };
+          const title = `Order Update: ${existing.code}`;
+          const message = `Your winning lot "${existing.title}" settlement status is now: ${statusLabels[winnerStatus]}.`;
+          await db.insert(notifications).values({
+            userId: existing.winnerId,
+            type: 'settlement_update',
+            title,
+            message,
+            auctionId,
+          });
+          io.emit('notification:user', {
+            userId: existing.winnerId,
+            type: 'settlement_update',
+            title,
+            message,
+            auctionId,
+          });
+        }
+
+        await logAdminAction(
+          req,
+          'WINNER_STATUS_UPDATED',
+          'Auction',
+          auctionId,
+          `Updated settlement status for ${existing.code} to ${winnerStatus}`
+        );
+
+        res.json({ auction: updated, message: `Winner status updated to ${winnerStatus}.` });
+      } catch (err) {
+        console.error('PATCH /admin/winners/:auctionId/status error:', err);
+        res.status(500).json({ error: 'Failed to update winner status.' });
+      }
+    }
+  );
+
+  router.post(
+    '/winners/:auctionId/notify',
+    requirePermission('manage_bids'),
+    async (req: AuthRequest, res) => {
+      try {
+        const auctionId = Number(req.params.auctionId);
+        const [existing] = await db
+          .select()
+          .from(auctions)
+          .where(eq(auctions.id, auctionId))
+          .limit(1);
+        if (!existing) return res.status(404).json({ error: 'Auction not found.' });
+        if (!existing.winnerId || !existing.winnerUsername) {
+          return res.status(400).json({ error: 'No winning bidder recorded for this auction.' });
+        }
+
+        await notifyAuctionWinnerAndAdmins(
+          io,
+          {
+            id: existing.id,
+            code: existing.code,
+            title: existing.title,
+            sellerId: existing.sellerId,
+          },
+          {
+            userId: existing.winnerId,
+            username: existing.winnerUsername,
+            amount: existing.winningBidAmount ?? existing.currentBid,
+          }
+        );
+
+        await db
+          .update(auctions)
+          .set({ winnerStatus: 'notified', updatedAt: new Date() })
+          .where(eq(auctions.id, auctionId));
+
+        await logAdminAction(
+          req,
+          'WINNER_NOTIFIED',
+          'Auction',
+          auctionId,
+          `Sent winner notification for ${existing.code} to @${existing.winnerUsername}`
+        );
+
+        res.json({
+          success: true,
+          message: `Winner @${existing.winnerUsername} and administrators notified.`,
+        });
+      } catch (err) {
+        console.error('POST /admin/winners/:auctionId/notify error:', err);
+        res.status(500).json({ error: 'Failed to send winner notification.' });
+      }
+    }
+  );
+
+  // ================= ADMIN INBOX NOTIFICATIONS =================
+  router.get('/notifications', async (req: AuthRequest, res) => {
+    try {
+      const rows = await db
+        .select()
+        .from(notifications)
+        .where(eq(notifications.userId, req.auth!.user.id))
+        .orderBy(desc(notifications.createdAt))
+        .limit(60);
+      res.json({
+        notifications: rows,
+        unreadCount: rows.filter((n) => !n.isRead).length,
+      });
+    } catch (err) {
+      console.error('GET /admin/notifications error:', err);
+      res.status(500).json({ error: 'Failed to load admin notifications.' });
+    }
+  });
+
+  router.patch('/notifications/read', async (req: AuthRequest, res) => {
+    try {
+      const notifId = req.body.id ? Number(req.body.id) : null;
+      if (notifId) {
+        await db
+          .update(notifications)
+          .set({ isRead: true })
+          .where(and(eq(notifications.id, notifId), eq(notifications.userId, req.auth!.user.id)));
+      } else {
+        await db
+          .update(notifications)
+          .set({ isRead: true })
+          .where(eq(notifications.userId, req.auth!.user.id));
+      }
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to mark notifications as read.' });
+    }
+  });
+
   // Delete auction
   router.delete('/auctions/:id', requirePermission('manage_auctions'), async (req: AuthRequest, res) => {
     try {
@@ -983,6 +1673,7 @@ export function createAdminRouter(io: SocketIOServer) {
         `Deleted auction ${existing.code}: "${existing.title}"`
       );
       io.emit('auction:updated', { auctionId, deleted: true });
+      io.emit('slots:updated', { auctionId, deleted: true });
       res.json({ success: true, message: `Auction ${existing.code} deleted.` });
     } catch (err) {
       console.error('DELETE /admin/auctions/:id error:', err);
@@ -1059,6 +1750,14 @@ export function createAdminRouter(io: SocketIOServer) {
         requireEmailVerification: Boolean(req.body.requireEmailVerification),
         defaultBidIncrement: Math.max(100, Number(req.body.defaultBidIncrement || 5000)),
         antiSnipingSeconds: Math.max(10, Math.min(300, Number(req.body.antiSnipingSeconds || 60))),
+        timeBetweenAuctionsMinutes: Math.max(
+          0,
+          Math.min(1440, Math.round(Number(req.body.timeBetweenAuctionsMinutes ?? 15)))
+        ),
+        defaultSlotDurationMinutes: Math.max(
+          5,
+          Math.min(1440, Math.round(Number(req.body.defaultSlotDurationMinutes ?? 60)))
+        ),
         updatedBy: req.auth!.user.id,
         updatedAt: new Date(),
       };
@@ -1079,10 +1778,11 @@ export function createAdminRouter(io: SocketIOServer) {
         'WEBSITE_SETTINGS_UPDATED',
         'Settings',
         updated.id,
-        `Updated platform settings (${updated.siteName})`
+        `Updated platform settings (${updated.siteName}, slot gap: ${updated.timeBetweenAuctionsMinutes}m, slot duration: ${updated.defaultSlotDurationMinutes}m)`
       );
 
       io.emit('settings:updated', updated);
+      io.emit('slots:updated', { reason: 'settings_changed' });
       res.json({ settings: updated, message: 'Website settings saved successfully.' });
     } catch (err) {
       console.error('PUT /admin/settings error:', err);
